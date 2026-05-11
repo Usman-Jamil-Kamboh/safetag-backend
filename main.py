@@ -2287,7 +2287,7 @@ mpin.addEventListener('input',()=>{{if(mpin.value.length===4) document.getElemen
       </div>
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;
                   max-width:220px;margin:0 auto 18px">
-        {chr(10).join('<button type="button" onclick="dp(' + chr(39) + d + chr(39) + ')" style="padding:14px;font-size:18px;font-weight:600;background:#f5f5f0;border:1.5px solid #e8e8e8;border-radius:11px;cursor:pointer">' + d + '</button>' for d in ['1','2','3','4','5','6','7','8','9','','0','\u232b'])}
+        {chr(10).join('<button type="button" onclick="dp(' + chr(39) + d + chr(39) + ')" style="padding:14px;font-size:18px;font-weight:600;background:#f5f5f0;border:1.5px solid #e8e8e8;border-radius:11px;cursor:pointer">' + d + '</button>' for d in ['1','2','3','4','5','6','7','8','9','','0','⌫'])}
       </div>
       <button type="submit" style="width:100%;padding:14px;background:#dc2626;color:#fff;
               border:none;border-radius:13px;font-size:15px;font-weight:700;
@@ -2304,7 +2304,7 @@ mpin.addEventListener('input',()=>{{if(mpin.value.length===4) document.getElemen
 <script>
 const dpin = document.getElementById('deact-pin');
 function dp(v){{
-  if(v==='\u232b'){{dpin.value=dpin.value.slice(0,-1);return;}}
+  if(v==='⌫'){{dpin.value=dpin.value.slice(0,-1);return;}}
   if(dpin.value.length<4) dpin.value+=v;
 }}
 dpin.addEventListener('input',()=>{{dpin.value=dpin.value.replace(/\\D/g,'').slice(0,4);}});
@@ -2473,13 +2473,13 @@ function sendLocationToOwner() {{
 
   btn.disabled = true;
   btn.style.opacity = '0.6';
-  btnText.textContent = 'Getting GPS location\u2026';
-  setStatus('\U0001f4e1 Requesting location \u2014 tap <strong>Allow</strong> if your browser asks.', '#374151', 'rgba(255,255,255,.85)');
+  btnText.textContent = 'Getting GPS location…';
+  setStatus('📡 Requesting location — tap <strong>Allow</strong> if your browser asks.', '#374151', 'rgba(255,255,255,.85)');
 
   function restoreOwnerBtn() {{
     btn.disabled = false;
     btn.style.opacity = '1';
-    btnText.textContent = '\U0001f4f2 Send Location to Vehicle Owner';
+    btnText.textContent = '📲 Send Location to Vehicle Owner';
   }}
 
   function tryGetOwner(highAccuracy) {{
@@ -2515,7 +2515,7 @@ function sendLocationToOwner() {{
             'font-size:12px;font-weight:700;text-decoration:none;' +
             'display:inline-flex;align-items:center;gap:5px;' +
             'box-shadow:0 2px 8px rgba(22,163,74,.28);';
-          waBtn.innerHTML = '\U0001f4ac WhatsApp';
+          waBtn.innerHTML = '💬 WhatsApp';
           btnGroup.appendChild(waBtn);
         }}
 
@@ -2538,24 +2538,24 @@ function sendLocationToOwner() {{
 
         setStatus(
           OWNER_WA_NUM
-            ? '\u2705 <strong>Location ready.</strong> Tap <strong>WhatsApp</strong> to send \u2014 or SMS as fallback.'
-            : '\u2705 <strong>Location ready.</strong> Owner is not on WhatsApp \u2014 tap <strong>SMS</strong> to send.',
+            ? '✅ <strong>Location ready.</strong> Tap <strong>WhatsApp</strong> to send — or SMS as fallback.'
+            : '✅ <strong>Location ready.</strong> Owner is not on WhatsApp — tap <strong>SMS</strong> to send.',
           '#166534', 'rgba(220,252,231,.8)'
         );
       }},
       (err) => {{
         if (err.code === 3 && highAccuracy) {{
-          setStatus('\u23f3 GPS timed out \u2014 trying network location\u2026', '#6b7280', 'rgba(255,255,255,.85)');
+          setStatus('⏳ GPS timed out — trying network location…', '#6b7280', 'rgba(255,255,255,.85)');
           tryGetOwner(false);
           return;
         }}
         restoreOwnerBtn();
         const msgs = {{
-          1: '\u274c <strong>Permission denied.</strong> Go to browser Settings \u2192 Site Permissions \u2192 Location, allow this site, then retry.',
-          2: '\u274c <strong>Location unavailable.</strong> Make sure GPS / Location Services are turned ON in your phone settings.',
-          3: '\u274c <strong>Timed out.</strong> Move to an open area with a better signal and try again.',
+          1: '❌ <strong>Permission denied.</strong> Go to browser Settings → Site Permissions → Location, allow this site, then retry.',
+          2: '❌ <strong>Location unavailable.</strong> Make sure GPS / Location Services are turned ON in your phone settings.',
+          3: '❌ <strong>Timed out.</strong> Move to an open area with a better signal and try again.',
         }};
-        setStatus(msgs[err.code] || '\u274c Location error: ' + err.message, '#dc2626', 'rgba(254,242,242,.9)');
+        setStatus(msgs[err.code] || '❌ Location error: ' + err.message, '#dc2626', 'rgba(254,242,242,.9)');
       }},
       {{ enableHighAccuracy: highAccuracy, timeout: highAccuracy ? 20000 : 10000, maximumAge: 0 }}
     );

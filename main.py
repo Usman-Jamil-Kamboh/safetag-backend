@@ -1390,10 +1390,9 @@ def admin_dashboard_page(stats, rows, total, page, per_page, key="") -> str:
     def _theme_card(k, v):
         preview = v["preview"]
         label = v["label"]
-        onclick_attr = 'onclick="selectTheme(' + "'" + k + "'" + ')"'
-        return (f'<div class="theme-card" data-theme="{k}" {onclick_attr} style="border-color:{preview}">'
-                f'<div class="theme-dot" style="background:{preview};border:2px solid rgba(255,255,255,.15)"></div>'
-                f'<span>{label}</span></div>')
+        return (f"<div class=\"theme-card\" data-theme=\"{k}\" onclick=\"selectTheme('{k}')\" style=\"border-color:{preview}\">"
+                f"<div class=\"theme-dot\" style=\"background:{preview};border:2px solid rgba(255,255,255,.15)\"></div>"
+                f"<span>{label}</span></div>")
     theme_options = "".join(
         _theme_card(k, v)
         for k, v in THEMES.items()
@@ -2528,7 +2527,7 @@ function sendLocationToOwner() {{
             'font-size:12px;font-weight:600;text-decoration:none;' +
             'display:inline-flex;align-items:center;gap:4px;border:1.5px solid #e5e7eb;';
           smsBtn.title = 'SMS fallback if WhatsApp unavailable';
-          smsBtn.innerHTML = '\U0001f4f1 SMS';
+          smsBtn.innerHTML = '📱 SMS';
           btnGroup.appendChild(smsBtn);
         }}
 

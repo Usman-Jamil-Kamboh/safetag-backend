@@ -947,7 +947,7 @@ def admin_download_zip(
 # HEALTH
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     try:
         conn = get_db(); conn.close(); db_status = "connected"

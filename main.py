@@ -4,7 +4,11 @@ Pasbaan Pakistan — FastAPI Backend (PostgreSQL + Sequential IDs + Admin UI)
 
 QR ID FORMAT:  ST-000001, ST-000002, ST-000003 ... auto-increments forever
 ADMIN UI:      GET /admin  → beautiful login + dashboard (no browser tools needed)
-SCAN LOGIC:    scan_count==0 → owner setup form | scan_count>=1 → contact page
+SCAN LOGIC:    scan_count==0 → plan selection → owner setup | scan_count>=1 → contact page
+
+PLANS:
+  basic   — Rs. 399/6 months — public phone numbers shown on contact page
+  premium — Rs. 399/6 months + call packs — masked calling via Twilio (coming soon)
 """
 
 import hashlib, hmac, io, json, os, secrets, sys, time, zipfile
@@ -287,6 +291,46 @@ def init_db():
     """)
     conn.commit()
 
+    # 5. Create subscriptions table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id           SERIAL    PRIMARY KEY,
+            qr_id        TEXT      NOT NULL REFERENCES qr_codes(qr_id) ON DELETE CASCADE,
+            plan         TEXT      NOT NULL DEFAULT 'basic',
+            status       TEXT      NOT NULL DEFAULT 'trial',
+            started_at   TIMESTAMP NOT NULL DEFAULT NOW(),
+            expires_at   TIMESTAMP DEFAULT NULL,
+            created_at   TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+    """)
+    conn.commit()
+
+    # 6. Create call_packs table (Premium only — future use)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS call_packs (
+            id              SERIAL    PRIMARY KEY,
+            qr_id           TEXT      NOT NULL REFERENCES qr_codes(qr_id) ON DELETE CASCADE,
+            calls_purchased INTEGER   NOT NULL DEFAULT 0,
+            calls_remaining INTEGER   NOT NULL DEFAULT 0,
+            purchased_at    TIMESTAMP NOT NULL DEFAULT NOW(),
+            pack_label      TEXT      DEFAULT NULL
+        )
+    """)
+    conn.commit()
+
+    # 7. Create call_logs table (Premium only — future use)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS call_logs (
+            id          SERIAL    PRIMARY KEY,
+            qr_id       TEXT      NOT NULL,
+            contact_idx INTEGER   NOT NULL DEFAULT 0,
+            duration_s  INTEGER   DEFAULT NULL,
+            status      TEXT      DEFAULT 'initiated',
+            created_at  TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+    """)
+    conn.commit()
+
     cur.close()
     release_db(conn)
 
@@ -410,6 +454,51 @@ def db_update_owner(qr_id: str, payload: dict, pin_hash: str = None):
     conn.commit()
     cur.close()
     release_db(conn)
+
+
+def db_get_subscription(qr_id: str):
+    """Return the active subscription row for a qr_id, or None."""
+    conn = get_db()
+    cur  = conn.cursor()
+    cur.execute(
+        "SELECT * FROM subscriptions WHERE qr_id = %s ORDER BY created_at DESC LIMIT 1",
+        (qr_id,)
+    )
+    row = cur.fetchone()
+    cur.close()
+    release_db(conn)
+    return dict(row) if row else None
+
+
+def db_create_subscription(qr_id: str, plan: str = "basic"):
+    """Create a trial subscription for a newly activated QR code."""
+    from datetime import datetime, timedelta
+    expires = datetime.utcnow() + timedelta(days=180)   # 6-month trial
+    conn = get_db()
+    cur  = conn.cursor()
+    cur.execute(
+        """INSERT INTO subscriptions (qr_id, plan, status, started_at, expires_at)
+           VALUES (%s, %s, 'trial', NOW(), %s)
+           ON CONFLICT DO NOTHING""",
+        (qr_id, plan, expires)
+    )
+    conn.commit()
+    cur.close()
+    release_db(conn)
+
+
+def db_get_call_credits(qr_id: str) -> int:
+    """Return total remaining call credits across all packs for this qr_id."""
+    conn = get_db()
+    cur  = conn.cursor()
+    cur.execute(
+        "SELECT COALESCE(SUM(calls_remaining), 0) AS total FROM call_packs WHERE qr_id = %s",
+        (qr_id,)
+    )
+    row = cur.fetchone()
+    cur.close()
+    release_db(conn)
+    return int(row["total"]) if row else 0
 
 
 def db_stats() -> dict:
@@ -1041,7 +1130,8 @@ def scan_qr(qr_id: str, request: Request):
     db_increment_scan(qr_id)
     owner_data = record["owner_data"]
     if not owner_data:
-        return Response(content=page_setup(qr_id).encode("utf-8"), media_type="text/html; charset=utf-8")
+        # First scan — send to plan selection before setup
+        return RedirectResponse(url=f"/scan/{qr_id}/choose-plan", status_code=302)
     # Check deactivation AFTER confirming owner_data exists
     if record.get("is_active") is False:
         return Response(content=page_deactivated(qr_id).encode("utf-8"), media_type="text/html; charset=utf-8")
@@ -1049,6 +1139,51 @@ def scan_qr(qr_id: str, request: Request):
         owner_data = json.loads(owner_data)
     html = page_contact(qr_id, owner_data, record["scan_count"] + 1)
     return Response(content=html.encode("utf-8"), media_type="text/html; charset=utf-8")
+
+
+@app.get("/scan/{qr_id}/choose-plan", response_class=HTMLResponse)
+def choose_plan(qr_id: str):
+    """Plan selection page — shown before the setup form on first scan."""
+    record = db_get_record(qr_id)
+    if not record:
+        return Response(content=page_not_found(qr_id).encode("utf-8"),
+                        media_type="text/html; charset=utf-8", status_code=404)
+    if record["owner_data"] is not None:
+        return RedirectResponse(url=f"/scan/{qr_id}", status_code=302)
+    return HTMLResponse(page_choose_plan(qr_id))
+
+
+@app.post("/scan/{qr_id}/select-plan", response_class=HTMLResponse)
+async def select_plan(qr_id: str, plan: str = Form("basic")):
+    """Save chosen plan in session cookie, redirect to setup form."""
+    if plan not in ("basic", "premium"):
+        plan = "basic"
+    record = db_get_record(qr_id)
+    if not record:
+        raise HTTPException(404, "QR code not found")
+    if record["owner_data"] is not None:
+        return RedirectResponse(url=f"/scan/{qr_id}", status_code=302)
+    response = RedirectResponse(url=f"/scan/{qr_id}/setup", status_code=303)
+    # Store chosen plan in a short-lived cookie so the setup form knows
+    response.set_cookie(
+        f"plan_{qr_id}", plan,
+        httponly=True, max_age=3600,
+        samesite="none", secure=True,
+    )
+    return response
+
+
+@app.get("/scan/{qr_id}/setup", response_class=HTMLResponse)
+def setup_form(qr_id: str, request: Request):
+    """Show the setup form — only reachable after choosing a plan."""
+    record = db_get_record(qr_id)
+    if not record:
+        return Response(content=page_not_found(qr_id).encode("utf-8"),
+                        media_type="text/html; charset=utf-8", status_code=404)
+    if record["owner_data"] is not None:
+        return RedirectResponse(url=f"/scan/{qr_id}", status_code=302)
+    chosen_plan = request.cookies.get(f"plan_{qr_id}", "basic")
+    return HTMLResponse(page_setup(qr_id, chosen_plan))
 
 
 @app.post("/scan/{qr_id}/setup", response_class=HTMLResponse)
@@ -1166,7 +1301,16 @@ async def save_setup(
         "message":        message.strip(),
     }
     db_save_owner(qr_id, payload, hash_pin(owner_pin))
-    return HTMLResponse(page_success(qr_id, owner_name.strip()))
+
+    # Create subscription record using plan chosen on plan-selection page
+    chosen_plan = request.cookies.get(f"plan_{qr_id}", "basic")
+    if chosen_plan not in ("basic", "premium"):
+        chosen_plan = "basic"
+    db_create_subscription(qr_id, chosen_plan)
+
+    response = HTMLResponse(page_success(qr_id, owner_name.strip(), chosen_plan))
+    response.delete_cookie(f"plan_{qr_id}")
+    return response
 
 
 @app.post("/scan/{qr_id}/deactivate", response_class=HTMLResponse)
@@ -1928,14 +2072,273 @@ def _logo() -> str:
 </div>"""
 
 
-def page_setup(qr_id: str) -> str:
+def page_choose_plan(qr_id: str) -> str:
+    """Plan selection page — shown to owner on first scan before setup."""
+    return f"""<!DOCTYPE html><html lang="en">
+<head><meta charset="UTF-8">{_css()}<title>Choose Your Plan — {qr_id}</title>
+<style>
+.plan-wrap{{margin-bottom:16px;position:relative}}
+.plan-card{{
+  background:#fff;border-radius:20px;padding:22px 18px 18px;
+  border:2px solid #e8e8e8;transition:border-color .2s,box-shadow .2s;
+}}
+.plan-card.basic{{border-color:#86efac;background:#fafffe}}
+.plan-card.premium{{border-color:#a78bfa;background:linear-gradient(160deg,#faf5ff 0%,#ede9fe 100%)}}
+.popular-tag{{
+  position:absolute;top:-11px;left:50%;transform:translateX(-50%);
+  background:linear-gradient(135deg,#7c3aed,#6d28d9);
+  color:#fff;font-size:11px;font-weight:700;padding:4px 18px;
+  border-radius:20px;letter-spacing:.05em;white-space:nowrap;
+}}
+.plan-header{{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}}
+.plan-badge{{
+  display:inline-block;padding:4px 12px;border-radius:20px;
+  font-size:11px;font-weight:700;letter-spacing:.06em;
+}}
+.plan-price{{font-size:26px;font-weight:800;color:#111;line-height:1}}
+.plan-price span{{font-size:13px;font-weight:500;color:#888}}
+.plan-tagline{{font-size:12px;font-weight:600;margin:6px 0 14px}}
+
+/* Comparison table */
+.cmp-table{{width:100%;border-collapse:collapse;margin:0 0 6px}}
+.cmp-table th{{
+  padding:8px 10px;font-size:10px;font-weight:700;letter-spacing:.07em;
+  text-transform:uppercase;color:#888;border-bottom:2px solid #f0f0ee;
+  text-align:center;
+}}
+.cmp-table th:first-child{{text-align:left}}
+.cmp-table td{{
+  padding:9px 10px;font-size:13px;border-bottom:1px solid #f5f5f3;
+  text-align:center;vertical-align:middle;
+}}
+.cmp-table td:first-child{{text-align:left;color:#374151;font-weight:500}}
+.cmp-table tr:last-child td{{border-bottom:none}}
+.tick{{color:#16a34a;font-size:16px;font-weight:700}}
+.cross{{color:#dc2626;font-size:15px}}
+.highlight-row td{{background:#f5f0ff}}
+.highlight-row td:first-child{{border-radius:8px 0 0 8px}}
+.highlight-row td:last-child{{border-radius:0 8px 8px 0}}
+
+/* Who pays callout boxes */
+.who-pays{{
+  border-radius:12px;padding:11px 13px;margin-bottom:14px;
+  display:flex;align-items:flex-start;gap:10px;
+}}
+.who-pays .wp-icon{{font-size:22px;flex-shrink:0;line-height:1}}
+.who-pays .wp-text{{font-size:12px;line-height:1.55}}
+.who-pays .wp-title{{font-size:12px;font-weight:700;margin-bottom:3px}}
+
+/* Pack pricing mini table */
+.pack-row{{display:flex;justify-content:space-between;align-items:center;
+           padding:7px 0;border-bottom:1px solid #ede9fe;font-size:12px}}
+.pack-row:last-child{{border-bottom:none}}
+
+.plan-btn{{
+  width:100%;padding:14px;border:none;border-radius:13px;font-size:15px;
+  font-weight:700;cursor:pointer;margin-top:14px;font-family:inherit;
+  transition:opacity .15s,transform .1s;letter-spacing:.01em;
+}}
+.plan-btn:active{{transform:scale(.98)}}
+</style>
+</head>
+<body><div class="wrap">{_logo()}
+
+<div style="text-align:center;margin-bottom:22px">
+  <h2 style="font-size:20px;font-weight:800;color:#111;margin-bottom:6px">Choose Your Plan</h2>
+  <p style="font-size:13px;color:#888;line-height:1.6">
+    Both plans are <strong>free for the first 6 months</strong>.<br>No payment needed right now.
+  </p>
+  <p style="font-size:11px;color:#bbb;margin-top:5px">Sticker ID: <code>{qr_id}</code></p>
+</div>
+
+<!-- COMPARISON TABLE -->
+<div class="card" style="padding:18px 16px;margin-bottom:18px;">
+  <div class="sec-title" style="margin-bottom:12px">📊 Plan Comparison</div>
+  <table class="cmp-table">
+    <thead>
+      <tr>
+        <th>Feature</th>
+        <th style="color:#166534">🔵 Basic</th>
+        <th style="color:#7c3aed">👑 Premium</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Price (per 6 months)</td>
+        <td style="font-weight:700;color:#111">Rs. 399</td>
+        <td style="font-weight:700;color:#111">Rs. 399<br><span style="font-size:11px;color:#7c3aed;font-weight:400">+ call packs</span></td>
+      </tr>
+      <tr>
+        <td>Emergency contact page</td>
+        <td><span class="tick">✓</span></td>
+        <td><span class="tick">✓</span></td>
+      </tr>
+      <tr>
+        <td>GPS location via WhatsApp</td>
+        <td><span class="tick">✓</span></td>
+        <td><span class="tick">✓</span></td>
+      </tr>
+      <tr>
+        <td>Up to 3 contacts</td>
+        <td><span class="tick">✓</span></td>
+        <td><span class="tick">✓</span></td>
+      </tr>
+      <tr class="highlight-row">
+        <td><strong>Owner's numbers visible?</strong></td>
+        <td style="color:#dc2626;font-weight:700">Yes — public</td>
+        <td style="color:#16a34a;font-weight:700">No — hidden</td>
+      </tr>
+      <tr class="highlight-row">
+        <td><strong>Who pays for calls?</strong></td>
+        <td style="color:#374151">Scanner pays<br><span style="font-size:11px;color:#888">(their own airtime)</span></td>
+        <td style="color:#7c3aed;font-weight:700">Owner pays<br><span style="font-size:11px;color:#888">(from call pack)</span></td>
+      </tr>
+      <tr class="highlight-row">
+        <td><strong>Scanner sees numbers?</strong></td>
+        <td style="color:#dc2626">Yes</td>
+        <td style="color:#16a34a;font-weight:700">Never</td>
+      </tr>
+      <tr>
+        <td>Calls never expire</td>
+        <td><span class="cross">—</span></td>
+        <td><span class="tick">✓</span></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- BASIC PLAN CARD -->
+<div class="plan-wrap">
+  <form method="POST" action="/scan/{qr_id}/select-plan">
+    <input type="hidden" name="plan" value="basic">
+    <div class="plan-card basic">
+      <div class="plan-header">
+        <div class="plan-badge" style="background:#dcfce7;color:#166534;">🔵 BASIC</div>
+        <div style="text-align:right">
+          <div class="plan-price">Rs. 399 <span>/ 6 mo</span></div>
+        </div>
+      </div>
+      <p class="plan-tagline" style="color:#16a34a">Free for first 6 months — no payment needed now</p>
+
+      <!-- Who pays box -->
+      <div class="who-pays" style="background:#fef9c3;border:1.5px solid #fde047;">
+        <div class="wp-icon">📞</div>
+        <div class="wp-text">
+          <div class="wp-title" style="color:#854d0e">How calling works on Basic</div>
+          <span style="color:#713f12">
+            Your phone numbers are <strong>shown publicly</strong> on the contact page.
+            The scanner calls you <strong>directly from their own phone</strong> using their own airtime.
+            You pay nothing per call — but your number is visible to everyone.
+          </span>
+        </div>
+      </div>
+
+      <button type="submit" class="plan-btn" style="background:#111;color:#fff;">
+        Continue with Basic →
+      </button>
+    </div>
+  </form>
+</div>
+
+<!-- PREMIUM PLAN CARD -->
+<div class="plan-wrap">
+  <div class="popular-tag">⭐ RECOMMENDED FOR PRIVACY</div>
+  <form method="POST" action="/scan/{qr_id}/select-plan">
+    <input type="hidden" name="plan" value="premium">
+    <div class="plan-card premium">
+      <div class="plan-header">
+        <div class="plan-badge" style="background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;">👑 PREMIUM</div>
+        <div style="text-align:right">
+          <div class="plan-price">Rs. 399 <span>/ 6 mo</span></div>
+          <div style="font-size:11px;color:#7c3aed;margin-top:2px">+ call packs</div>
+        </div>
+      </div>
+      <p class="plan-tagline" style="color:#7c3aed">Numbers private forever. Scanner calls for free.</p>
+
+      <!-- Who pays box -->
+      <div class="who-pays" style="background:#f0fdf4;border:1.5px solid #86efac;">
+        <div class="wp-icon">🔒</div>
+        <div class="wp-text">
+          <div class="wp-title" style="color:#166534">How calling works on Premium</div>
+          <span style="color:#15803d">
+            Your numbers are <strong>never shown</strong> to anyone.
+            The scanner taps Call and is connected through <strong>Pasbaan's masked line</strong> — 
+            completely free for them. You pre-buy call minutes — 
+            each 2-min call deducts from your balance.
+          </span>
+        </div>
+      </div>
+
+      <!-- Call pack pricing -->
+      <div style="background:#fff;border:1.5px solid #ddd6fe;border-radius:12px;padding:12px 14px;margin-bottom:4px;">
+        <p style="font-size:11px;font-weight:700;color:#6d28d9;margin-bottom:8px;
+                  text-transform:uppercase;letter-spacing:.06em;">📦 Call Pack Pricing</p>
+        <div class="pack-row"><span style="color:#374151">20 calls (2 min each)</span><span style="font-weight:700;color:#111">Rs. 400</span></div>
+        <div class="pack-row"><span style="color:#374151">50 calls (2 min each)</span><span style="font-weight:700;color:#111">Rs. 1,000</span></div>
+        <div class="pack-row"><span style="color:#374151">100 calls (2 min each)</span><span style="font-weight:700;color:#111">Rs. 2,000</span></div>
+        <div class="pack-row"><span style="color:#374151">200 calls (2 min each)</span><span style="font-weight:700;color:#111">Rs. 4,000</span></div>
+        <p style="font-size:11px;color:#888;margin-top:8px;line-height:1.5">
+          ✨ <strong>No expiry</strong> — use them in one week or one year, your choice.
+        </p>
+      </div>
+
+      <button type="submit" class="plan-btn"
+        style="background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;
+               box-shadow:0 4px 14px rgba(124,58,237,.35);">
+        Continue with Premium →
+      </button>
+    </div>
+  </form>
+</div>
+
+<!-- FAQ -->
+<div class="card" style="background:#fafaf7;border:1.5px solid #e5e5e0;margin-top:4px;">
+  <div class="sec-title">❓ Common Questions</div>
+  <p style="font-size:13px;color:#555;margin-bottom:10px;line-height:1.65">
+    <strong>Can I upgrade later?</strong><br>
+    Yes — you can switch from Basic to Premium anytime from your contact page.
+  </p>
+  <p style="font-size:13px;color:#555;margin-bottom:10px;line-height:1.65">
+    <strong>What if my Premium call balance runs out?</strong><br>
+    The scanner will see a message to contact you via WhatsApp instead. You'll get an alert to top up.
+  </p>
+  <p style="font-size:13px;color:#555;line-height:1.65">
+    <strong>Do call packs expire?</strong><br>
+    Never. Buy once, use whenever you need them.
+  </p>
+</div>
+
+<p class="note" style="margin-top:14px;margin-bottom:24px">
+  Pasbaan Pakistan · Secure Vehicle Emergency System
+</p>
+</div></body></html>"""
+
+
+def page_setup(qr_id: str, plan: str = "basic") -> str:
+    plan_banner = (
+        '''<div class="card" style="background:linear-gradient(135deg,#faf5ff,#ede9fe);'''
+        '''border:1.5px solid #a78bfa;padding:14px 16px;">'''
+        '''<div style="display:flex;align-items:center;gap:10px;">'''
+        '''<span style="font-size:22px">👑</span>'''
+        '''<div><p style="font-size:13px;font-weight:700;color:#6d28d9;margin-bottom:2px">Premium Plan Selected</p>'''
+        '''<p style="font-size:12px;color:#7c3aed;line-height:1.5">'''
+        '''Your phone numbers will be <strong>private</strong>. Call packs can be purchased after activation.</p></div></div></div>'''
+        if plan == "premium" else
+        '''<div class="card" style="background:#f0fdf4;border:1.5px solid #86efac;padding:14px 16px;">'''
+        '''<div style="display:flex;align-items:center;gap:10px;">'''
+        '''<span style="font-size:22px">🔵</span>'''
+        '''<div><p style="font-size:13px;font-weight:700;color:#166534;margin-bottom:2px">Basic Plan Selected</p>'''
+        '''<p style="font-size:12px;color:#16a34a;line-height:1.5">'''
+        '''Your phone numbers will be <strong>visible</strong> to anyone who scans your sticker.</p></div></div></div>'''
+    )
     return f"""<!DOCTYPE html><html lang="en">
 <head><meta charset="UTF-8">{_css()}<title>Activate Pasbaan — {qr_id}</title></head>
 <body><div class="wrap">{_logo()}
+{plan_banner}
 <div class="card">
   <span class="badge badge-amber">⚡ First scan — Activate your Pasbaan sticker</span>
   <p style="font-size:15px;line-height:1.65;color:#555">
-    Welcome! This is your Pasbaan sticker's first scan. Fill in your emergency contacts below —
+    Welcome! Fill in your emergency contacts below —
     they'll appear whenever someone scans your sticker.
   </p>
   <p style="font-size:11px;color:#ccc;margin-top:10px">Sticker ID: <code>{qr_id}</code></p>
@@ -2641,17 +3044,35 @@ function sendLocationToOwner() {{
 </body></html>"""
 
 
-def page_success(qr_id: str, name: str) -> str:
+def page_success(qr_id: str, name: str, plan: str = "basic") -> str:
+    plan_badge = (
+        '<div style="display:inline-block;margin-bottom:14px;padding:5px 16px;'
+        'background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;'
+        'border-radius:20px;font-size:12px;font-weight:700;letter-spacing:.05em;">👑 PREMIUM PLAN</div>'
+        if plan == "premium" else
+        '<div style="display:inline-block;margin-bottom:14px;padding:5px 16px;'
+        'background:#f0fdf4;color:#166534;border:1.5px solid #86efac;'
+        'border-radius:20px;font-size:12px;font-weight:700;">🔵 BASIC PLAN</div>'
+    )
+    plan_note = (
+        "<p style='font-size:12px;color:#7c3aed;margin-top:8px;line-height:1.6'>"
+        "🔒 Premium: Your numbers are private. Call packs coming soon.</p>"
+        if plan == "premium" else
+        "<p style='font-size:12px;color:#166534;margin-top:8px;line-height:1.6'>"
+        "📞 Basic: Your contact numbers are visible to anyone who scans your sticker.</p>"
+    )
     return f"""<!DOCTYPE html><html lang="en">
 <head><meta charset="UTF-8">{_css()}<title>Activated!</title></head>
 <body><div class="wrap">{_logo()}
 <div class="card" style="text-align:center;padding:40px 20px">
   <div style="font-size:60px;margin-bottom:16px">✅</div>
+  {plan_badge}
   <h2 style="font-size:22px;font-weight:700;margin-bottom:10px">Pasbaan Activated!</h2>
   <p style="color:#666;font-size:15px;line-height:1.65">
     {name}, your emergency contacts are saved.<br>
     Anyone who scans your sticker will see your contact page instantly.
   </p>
+  {plan_note}
   <div style="margin-top:22px;background:#f5f5f0;padding:14px;border-radius:12px">
     <p style="font-size:12px;color:#aaa;margin-bottom:4px">Your Sticker ID</p>
     <code style="font-size:17px;font-weight:700">{qr_id}</code>

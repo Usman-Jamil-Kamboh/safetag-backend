@@ -2073,245 +2073,270 @@ def _logo() -> str:
 
 
 def page_choose_plan(qr_id: str) -> str:
-    """Plan selection page — shown to owner on first scan before setup."""
+    """Plan selection page — clean professional redesign."""
     return f"""<!DOCTYPE html><html lang="en">
-<head><meta charset="UTF-8">{_css()}<title>Choose Your Plan — {qr_id}</title>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Choose Plan — Pasbaan</title>
 <style>
-.plan-wrap{{margin-bottom:16px;position:relative}}
-.plan-card{{
-  background:#fff;border-radius:20px;padding:22px 18px 18px;
-  border:2px solid #e8e8e8;transition:border-color .2s,box-shadow .2s;
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background:#f0f0eb;min-height:100vh;padding:24px 16px 48px;color:#111;
 }}
-.plan-card.basic{{border-color:#86efac;background:#fafffe}}
-.plan-card.premium{{border-color:#a78bfa;background:linear-gradient(160deg,#faf5ff 0%,#ede9fe 100%)}}
-.popular-tag{{
-  position:absolute;top:-11px;left:50%;transform:translateX(-50%);
-  background:linear-gradient(135deg,#7c3aed,#6d28d9);
-  color:#fff;font-size:11px;font-weight:700;padding:4px 18px;
-  border-radius:20px;letter-spacing:.05em;white-space:nowrap;
-}}
-.plan-header{{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}}
-.plan-badge{{
-  display:inline-block;padding:4px 12px;border-radius:20px;
-  font-size:11px;font-weight:700;letter-spacing:.06em;
-}}
-.plan-price{{font-size:26px;font-weight:800;color:#111;line-height:1}}
-.plan-price span{{font-size:13px;font-weight:500;color:#888}}
-.plan-tagline{{font-size:12px;font-weight:600;margin:6px 0 14px}}
+.wrap{{max-width:420px;margin:0 auto}}
 
-/* Comparison table */
-.cmp-table{{width:100%;border-collapse:collapse;margin:0 0 6px}}
-.cmp-table th{{
-  padding:8px 10px;font-size:10px;font-weight:700;letter-spacing:.07em;
-  text-transform:uppercase;color:#888;border-bottom:2px solid #f0f0ee;
-  text-align:center;
-}}
-.cmp-table th:first-child{{text-align:left}}
-.cmp-table td{{
-  padding:9px 10px;font-size:13px;border-bottom:1px solid #f5f5f3;
-  text-align:center;vertical-align:middle;
-}}
-.cmp-table td:first-child{{text-align:left;color:#374151;font-weight:500}}
-.cmp-table tr:last-child td{{border-bottom:none}}
-.tick{{color:#16a34a;font-size:16px;font-weight:700}}
-.cross{{color:#dc2626;font-size:15px}}
-.highlight-row td{{background:#f5f0ff}}
-.highlight-row td:first-child{{border-radius:8px 0 0 8px}}
-.highlight-row td:last-child{{border-radius:0 8px 8px 0}}
+/* Logo */
+.logo{{text-align:center;padding:8px 0 22px}}
+.logo-name{{font-size:22px;font-weight:700;letter-spacing:-.4px}}
+.logo-dot{{color:#b90a0a}}
+.logo-sub{{font-size:11px;color:#aaa;margin-top:3px;letter-spacing:.05em;text-transform:uppercase}}
 
-/* Who pays callout boxes */
-.who-pays{{
-  border-radius:12px;padding:11px 13px;margin-bottom:14px;
-  display:flex;align-items:flex-start;gap:10px;
+/* Page heading */
+.page-title{{text-align:center;margin-bottom:22px}}
+.page-title h2{{font-size:21px;font-weight:800;color:#111;margin-bottom:5px}}
+.page-title p{{font-size:13px;color:#888;line-height:1.55}}
+.qr-chip{{display:inline-block;margin-top:8px;padding:3px 12px;
+          background:#fff;border:1px solid #e0e0e0;border-radius:20px;
+          font-size:11px;color:#aaa;font-family:monospace}}
+
+/* Plan cards */
+.plan{{background:#fff;border-radius:18px;overflow:hidden;
+       margin-bottom:14px;border:2px solid transparent;
+       box-shadow:0 1px 4px rgba(0,0,0,.06);position:relative}}
+.plan.basic{{border-color:#d1fae5}}
+.plan.premium{{border-color:#ddd6fe}}
+
+.plan-top{{padding:20px 20px 16px}}
+.plan-top.basic-top{{background:linear-gradient(135deg,#f0fdf4,#dcfce7)}}
+.plan-top.premium-top{{background:linear-gradient(135deg,#faf5ff,#ede9fe)}}
+
+.plan-label{{display:flex;align-items:center;gap:8px;margin-bottom:10px}}
+.plan-pill{{padding:3px 11px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:.05em}}
+.rec-tag{{margin-left:auto;font-size:10px;font-weight:700;padding:2px 10px;
+          border-radius:20px;background:#7c3aed;color:#fff;letter-spacing:.04em}}
+
+.plan-price-row{{display:flex;align-items:baseline;gap:5px}}
+.plan-price{{font-size:30px;font-weight:800;color:#111;line-height:1}}
+.plan-period{{font-size:13px;color:#888;font-weight:400}}
+.plan-free-note{{font-size:12px;font-weight:600;margin-top:5px}}
+
+/* Divider */
+.plan-divider{{height:1px;background:#f0f0ee;margin:0 20px}}
+
+/* Feature section */
+.plan-body{{padding:16px 20px}}
+
+/* WHO PAYS — the key differentiator */
+.who-pays-box{{
+  border-radius:11px;padding:12px 14px;margin-bottom:14px;
+  display:flex;gap:11px;align-items:flex-start;
 }}
-.who-pays .wp-icon{{font-size:22px;flex-shrink:0;line-height:1}}
-.who-pays .wp-text{{font-size:12px;line-height:1.55}}
-.who-pays .wp-title{{font-size:12px;font-weight:700;margin-bottom:3px}}
+.wp-icon{{font-size:20px;flex-shrink:0;margin-top:1px;line-height:1}}
+.wp-label{{font-size:10px;font-weight:700;text-transform:uppercase;
+           letter-spacing:.07em;margin-bottom:4px}}
+.wp-desc{{font-size:12px;line-height:1.6}}
 
-/* Pack pricing mini table */
-.pack-row{{display:flex;justify-content:space-between;align-items:center;
-           padding:7px 0;border-bottom:1px solid #ede9fe;font-size:12px}}
-.pack-row:last-child{{border-bottom:none}}
+/* Feature list */
+.feat-list{{list-style:none;margin-bottom:16px}}
+.feat-list li{{display:flex;align-items:flex-start;gap:9px;
+               font-size:13px;color:#444;padding:5px 0;
+               border-bottom:1px solid #f5f5f3;line-height:1.4}}
+.feat-list li:last-child{{border-bottom:none}}
+.feat-list .fi{{font-size:14px;flex-shrink:0;margin-top:1px}}
 
+/* Pack pricing */
+.pack-grid{{
+  display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:14px;
+}}
+.pack-item{{
+  background:#f5f0ff;border:1.5px solid #ddd6fe;border-radius:10px;
+  padding:9px 11px;
+}}
+.pack-calls{{font-size:13px;font-weight:700;color:#6d28d9}}
+.pack-price{{font-size:12px;color:#888;margin-top:2px}}
+.pack-no-exp{{font-size:11px;color:#7c3aed;margin-top:3px;font-weight:600}}
+
+/* CTA button */
 .plan-btn{{
-  width:100%;padding:14px;border:none;border-radius:13px;font-size:15px;
-  font-weight:700;cursor:pointer;margin-top:14px;font-family:inherit;
+  width:100%;padding:14px;border:none;border-radius:12px;
+  font-size:15px;font-weight:700;cursor:pointer;font-family:inherit;
   transition:opacity .15s,transform .1s;letter-spacing:.01em;
 }}
-.plan-btn:active{{transform:scale(.98)}}
+.plan-btn:active{{transform:scale(.97)}}
+
+/* FAQ */
+.faq{{background:#fff;border-radius:16px;padding:18px 18px;
+      margin-top:6px;box-shadow:0 1px 4px rgba(0,0,0,.05)}}
+.faq-title{{font-size:10px;font-weight:700;text-transform:uppercase;
+            letter-spacing:.08em;color:#bbb;margin-bottom:12px}}
+.faq-q{{font-size:13px;font-weight:600;color:#111;margin-bottom:3px}}
+.faq-a{{font-size:12px;color:#777;line-height:1.6;margin-bottom:12px}}
+.faq-a:last-child{{margin-bottom:0}}
+
+.foot-note{{font-size:11px;color:#bbb;text-align:center;margin-top:16px;line-height:1.6}}
 </style>
 </head>
-<body><div class="wrap">{_logo()}
+<body>
+<div class="wrap">
 
-<div style="text-align:center;margin-bottom:22px">
-  <h2 style="font-size:20px;font-weight:800;color:#111;margin-bottom:6px">Choose Your Plan</h2>
-  <p style="font-size:13px;color:#888;line-height:1.6">
-    Both plans are <strong>free for the first 6 months</strong>.<br>No payment needed right now.
-  </p>
-  <p style="font-size:11px;color:#bbb;margin-top:5px">Sticker ID: <code>{qr_id}</code></p>
-</div>
+  <!-- Logo -->
+  <div class="logo">
+    <div class="logo-name">Pas<span class="logo-dot">baan</span></div>
+    <div class="logo-sub">Vehicle Emergency System</div>
+  </div>
 
-<!-- COMPARISON TABLE -->
-<div class="card" style="padding:18px 16px;margin-bottom:18px;">
-  <div class="sec-title" style="margin-bottom:12px">📊 Plan Comparison</div>
-  <table class="cmp-table">
-    <thead>
-      <tr>
-        <th>Feature</th>
-        <th style="color:#166534">🔵 Basic</th>
-        <th style="color:#7c3aed">👑 Premium</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td>Price (per 6 months)</td>
-        <td style="font-weight:700;color:#111">Rs. 399</td>
-        <td style="font-weight:700;color:#111">Rs. 399<br><span style="font-size:11px;color:#7c3aed;font-weight:400">+ call packs</span></td>
-      </tr>
-      <tr>
-        <td>Emergency contact page</td>
-        <td><span class="tick">✓</span></td>
-        <td><span class="tick">✓</span></td>
-      </tr>
-      <tr>
-        <td>GPS location via WhatsApp</td>
-        <td><span class="tick">✓</span></td>
-        <td><span class="tick">✓</span></td>
-      </tr>
-      <tr>
-        <td>Up to 3 contacts</td>
-        <td><span class="tick">✓</span></td>
-        <td><span class="tick">✓</span></td>
-      </tr>
-      <tr class="highlight-row">
-        <td><strong>Owner's numbers visible?</strong></td>
-        <td style="color:#dc2626;font-weight:700">Yes — public</td>
-        <td style="color:#16a34a;font-weight:700">No — hidden</td>
-      </tr>
-      <tr class="highlight-row">
-        <td><strong>Who pays for calls?</strong></td>
-        <td style="color:#374151">Scanner pays<br><span style="font-size:11px;color:#888">(their own airtime)</span></td>
-        <td style="color:#7c3aed;font-weight:700">Owner pays<br><span style="font-size:11px;color:#888">(from call pack)</span></td>
-      </tr>
-      <tr class="highlight-row">
-        <td><strong>Scanner sees numbers?</strong></td>
-        <td style="color:#dc2626">Yes</td>
-        <td style="color:#16a34a;font-weight:700">Never</td>
-      </tr>
-      <tr>
-        <td>Calls never expire</td>
-        <td><span class="cross">—</span></td>
-        <td><span class="tick">✓</span></td>
-      </tr>
-    </tbody>
-  </table>
-</div>
+  <!-- Heading -->
+  <div class="page-title">
+    <h2>Choose Your Plan</h2>
+    <p>Both plans are free for the first 6 months.<br>No payment needed right now.</p>
+    <span class="qr-chip">{qr_id}</span>
+  </div>
 
-<!-- BASIC PLAN CARD -->
-<div class="plan-wrap">
-  <form method="POST" action="/scan/{qr_id}/select-plan">
-    <input type="hidden" name="plan" value="basic">
-    <div class="plan-card basic">
-      <div class="plan-header">
-        <div class="plan-badge" style="background:#dcfce7;color:#166534;">🔵 BASIC</div>
-        <div style="text-align:right">
-          <div class="plan-price">Rs. 399 <span>/ 6 mo</span></div>
-        </div>
+  <!-- ── BASIC PLAN ── -->
+  <div class="plan basic">
+    <div class="plan-top basic-top">
+      <div class="plan-label">
+        <span class="plan-pill" style="background:#d1fae5;color:#065f46">🔵 BASIC</span>
       </div>
-      <p class="plan-tagline" style="color:#16a34a">Free for first 6 months — no payment needed now</p>
+      <div class="plan-price-row">
+        <span class="plan-price">Rs. 399</span>
+        <span class="plan-period">/ 6 months</span>
+      </div>
+      <p class="plan-free-note" style="color:#059669">Free for first 6 months</p>
+    </div>
+    <div class="plan-divider"></div>
+    <div class="plan-body">
 
-      <!-- Who pays box -->
-      <div class="who-pays" style="background:#fef9c3;border:1.5px solid #fde047;">
+      <!-- Who pays callout -->
+      <div class="who-pays-box" style="background:#fefce8;border:1.5px solid #fde68a;">
         <div class="wp-icon">📞</div>
-        <div class="wp-text">
-          <div class="wp-title" style="color:#854d0e">How calling works on Basic</div>
-          <span style="color:#713f12">
-            Your phone numbers are <strong>shown publicly</strong> on the contact page.
-            The scanner calls you <strong>directly from their own phone</strong> using their own airtime.
-            You pay nothing per call — but your number is visible to everyone.
-          </span>
+        <div>
+          <div class="wp-label" style="color:#92400e">Who pays for calls?</div>
+          <div class="wp-desc" style="color:#78350f">
+            The <strong>scanner pays</strong> — they call you directly from their own phone using their own airtime.
+            Your numbers are <strong>visible</strong> on the contact page.
+          </div>
         </div>
       </div>
 
-      <button type="submit" class="plan-btn" style="background:#111;color:#fff;">
-        Continue with Basic →
-      </button>
+      <ul class="feat-list">
+        <li><span class="fi">✅</span><span>Emergency contact page when sticker is scanned</span></li>
+        <li><span class="fi">✅</span><span>Up to 3 contacts with direct call buttons</span></li>
+        <li><span class="fi">✅</span><span>Live GPS location sharing via WhatsApp</span></li>
+        <li><span class="fi">✅</span><span>Pakistan emergency numbers (1122, Police, Edhi)</span></li>
+        <li><span class="fi">✅</span><span>Deactivate / reactivate anytime</span></li>
+        <li><span class="fi">⚠️</span><span style="color:#b45309"><strong>Phone numbers publicly visible</strong> to every scanner</span></li>
+      </ul>
+
+      <form method="POST" action="/scan/{qr_id}/select-plan">
+        <input type="hidden" name="plan" value="basic">
+        <button type="submit" class="plan-btn" style="background:#111;color:#fff;">
+          Continue with Basic &rarr;
+        </button>
+      </form>
     </div>
-  </form>
-</div>
+  </div>
 
-<!-- PREMIUM PLAN CARD -->
-<div class="plan-wrap">
-  <div class="popular-tag">⭐ RECOMMENDED FOR PRIVACY</div>
-  <form method="POST" action="/scan/{qr_id}/select-plan">
-    <input type="hidden" name="plan" value="premium">
-    <div class="plan-card premium">
-      <div class="plan-header">
-        <div class="plan-badge" style="background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;">👑 PREMIUM</div>
-        <div style="text-align:right">
-          <div class="plan-price">Rs. 399 <span>/ 6 mo</span></div>
-          <div style="font-size:11px;color:#7c3aed;margin-top:2px">+ call packs</div>
-        </div>
+  <!-- ── PREMIUM PLAN ── -->
+  <div class="plan premium">
+    <div class="plan-top premium-top">
+      <div class="plan-label">
+        <span class="plan-pill" style="background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff">👑 PREMIUM</span>
+        <span class="rec-tag">RECOMMENDED</span>
       </div>
-      <p class="plan-tagline" style="color:#7c3aed">Numbers private forever. Scanner calls for free.</p>
+      <div class="plan-price-row">
+        <span class="plan-price">Rs. 399</span>
+        <span class="plan-period">/ 6 months</span>
+      </div>
+      <p class="plan-free-note" style="color:#7c3aed">Free for first 6 months &nbsp;·&nbsp; <span style="font-weight:400;color:#9ca3af">+ call packs</span></p>
+    </div>
+    <div class="plan-divider"></div>
+    <div class="plan-body">
 
-      <!-- Who pays box -->
-      <div class="who-pays" style="background:#f0fdf4;border:1.5px solid #86efac;">
+      <!-- Who pays callout -->
+      <div class="who-pays-box" style="background:#f0fdf4;border:1.5px solid #86efac;">
         <div class="wp-icon">🔒</div>
-        <div class="wp-text">
-          <div class="wp-title" style="color:#166534">How calling works on Premium</div>
-          <span style="color:#15803d">
-            Your numbers are <strong>never shown</strong> to anyone.
-            The scanner taps Call and is connected through <strong>Pasbaan's masked line</strong> — 
-            completely free for them. You pre-buy call minutes — 
-            each 2-min call deducts from your balance.
-          </span>
+        <div>
+          <div class="wp-label" style="color:#166534">Who pays for calls?</div>
+          <div class="wp-desc" style="color:#15803d">
+            <strong>You pay</strong> — from your pre-bought call pack.
+            The scanner calls through Pasbaan's masked line, <strong>completely free for them</strong>.
+            Your real numbers are <strong>never revealed</strong> to anyone.
+          </div>
         </div>
       </div>
 
-      <!-- Call pack pricing -->
-      <div style="background:#fff;border:1.5px solid #ddd6fe;border-radius:12px;padding:12px 14px;margin-bottom:4px;">
-        <p style="font-size:11px;font-weight:700;color:#6d28d9;margin-bottom:8px;
-                  text-transform:uppercase;letter-spacing:.06em;">📦 Call Pack Pricing</p>
-        <div class="pack-row"><span style="color:#374151">20 calls (2 min each)</span><span style="font-weight:700;color:#111">Rs. 400</span></div>
-        <div class="pack-row"><span style="color:#374151">50 calls (2 min each)</span><span style="font-weight:700;color:#111">Rs. 1,000</span></div>
-        <div class="pack-row"><span style="color:#374151">100 calls (2 min each)</span><span style="font-weight:700;color:#111">Rs. 2,000</span></div>
-        <div class="pack-row"><span style="color:#374151">200 calls (2 min each)</span><span style="font-weight:700;color:#111">Rs. 4,000</span></div>
-        <p style="font-size:11px;color:#888;margin-top:8px;line-height:1.5">
-          ✨ <strong>No expiry</strong> — use them in one week or one year, your choice.
-        </p>
+      <ul class="feat-list">
+        <li><span class="fi">✅</span><span>Everything in Basic</span></li>
+        <li><span class="fi">🔒</span><span><strong>Numbers always private</strong> — hidden from every scanner</span></li>
+        <li><span class="fi">📞</span><span>Masked calling — scanner calls free through Pasbaan</span></li>
+        <li><span class="fi">📦</span><span>Buy call packs anytime — <strong>no expiry ever</strong></span></li>
+        <li><span class="fi">🛡️</span><span>Full privacy for your family's numbers</span></li>
+      </ul>
+
+      <!-- Call Pack grid -->
+      <p style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
+                color:#9ca3af;margin-bottom:8px">Call Pack Options</p>
+      <div class="pack-grid">
+        <div class="pack-item">
+          <div class="pack-calls">20 calls</div>
+          <div class="pack-price">Rs. 400</div>
+          <div class="pack-no-exp">No expiry</div>
+        </div>
+        <div class="pack-item">
+          <div class="pack-calls">50 calls</div>
+          <div class="pack-price">Rs. 1,000</div>
+          <div class="pack-no-exp">No expiry</div>
+        </div>
+        <div class="pack-item">
+          <div class="pack-calls">100 calls</div>
+          <div class="pack-price">Rs. 2,000</div>
+          <div class="pack-no-exp">No expiry</div>
+        </div>
+        <div class="pack-item">
+          <div class="pack-calls">200 calls</div>
+          <div class="pack-price">Rs. 4,000</div>
+          <div class="pack-no-exp">No expiry</div>
+        </div>
       </div>
+      <p style="font-size:11px;color:#9ca3af;margin-bottom:14px;line-height:1.5">
+        Each call = 2 minutes. Buy once, use at your own pace.
+      </p>
 
-      <button type="submit" class="plan-btn"
-        style="background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;
-               box-shadow:0 4px 14px rgba(124,58,237,.35);">
-        Continue with Premium →
-      </button>
+      <form method="POST" action="/scan/{qr_id}/select-plan">
+        <input type="hidden" name="plan" value="premium">
+        <button type="submit" class="plan-btn"
+          style="background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;
+                 box-shadow:0 4px 16px rgba(109,40,217,.3);">
+          Continue with Premium &rarr;
+        </button>
+      </form>
     </div>
-  </form>
-</div>
+  </div>
 
-<!-- FAQ -->
-<div class="card" style="background:#fafaf7;border:1.5px solid #e5e5e0;margin-top:4px;">
-  <div class="sec-title">❓ Common Questions</div>
-  <p style="font-size:13px;color:#555;margin-bottom:10px;line-height:1.65">
-    <strong>Can I upgrade later?</strong><br>
-    Yes — you can switch from Basic to Premium anytime from your contact page.
-  </p>
-  <p style="font-size:13px;color:#555;margin-bottom:10px;line-height:1.65">
-    <strong>What if my Premium call balance runs out?</strong><br>
-    The scanner will see a message to contact you via WhatsApp instead. You'll get an alert to top up.
-  </p>
-  <p style="font-size:13px;color:#555;line-height:1.65">
-    <strong>Do call packs expire?</strong><br>
-    Never. Buy once, use whenever you need them.
-  </p>
-</div>
+  <!-- FAQ -->
+  <div class="faq">
+    <div class="faq-title">Common Questions</div>
 
-<p class="note" style="margin-top:14px;margin-bottom:24px">
-  Pasbaan Pakistan · Secure Vehicle Emergency System
-</p>
-</div></body></html>"""
+    <div class="faq-q">Can I upgrade from Basic to Premium later?</div>
+    <div class="faq-a">Yes, anytime from your contact page. Your existing contacts and details stay intact.</div>
+
+    <div class="faq-q">What if my call pack balance runs out?</div>
+    <div class="faq-a">The scanner sees a WhatsApp fallback option and you get an alert to top up. No calls are lost mid-conversation.</div>
+
+    <div class="faq-q">Do call packs expire?</div>
+    <div class="faq-a">Never. Buy 200 calls today and use the last one two years from now — completely fine.</div>
+  </div>
+
+  <p class="foot-note">
+    Pasbaan Pakistan &nbsp;·&nbsp; Secure Vehicle Emergency System<br>
+    Both plans free for first 6 months — no card needed now
+  </p>
+
+</div>
+</body></html>"""
 
 
 def page_setup(qr_id: str, plan: str = "basic") -> str:

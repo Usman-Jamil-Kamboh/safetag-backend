@@ -3659,7 +3659,10 @@ def page_admin_subscriptions(rows: list) -> str:
             f'add a pack once they pay.'
         )
     for a in alerts:
-        alert_html += f'<div class="alert-box">{a}</div>\n'
+        alert_html += '<div class="alert-box">' + a + '</div>\n'
+
+    if not rows_html:
+        rows_html = '<tr><td colspan="6" style="text-align:center;color:#aaa;padding:30px">No subscriptions yet</td></tr>'
 
     return f"""<!DOCTYPE html><html lang="en">
 <head>
@@ -3770,8 +3773,7 @@ details summary::-webkit-details-marker{{display:none}}
           </tr>
         </thead>
         <tbody>
-          {rows_html if rows_html else
-           "<tr><td colspan=\'6\' style=\'text-align:center;color:#aaa;padding:30px\'>No subscriptions yet</td></tr>"}
+          {rows_html}
         </tbody>
       </table>
     </div>

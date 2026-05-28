@@ -1916,7 +1916,10 @@ tr:hover td{{background:#1a1a1a}}
     <div class="logo-name">Pas<span class="logo-dot">baan</span> <span style="color:#555;font-weight:400">Admin</span></div>
     <div class="logo-sub">Pasbaan Pakistan Dashboard</div>
   </div>
-  <a href="/admin/logout" class="logout">Logout</a>
+  <div style="display:flex;gap:8px;align-items:center">
+    <a href="/admin/subscriptions" class="logout" style="color:#22c55e;border-color:#14532d">💳 Subscriptions</a>
+    <a href="/admin/logout" class="logout">Logout</a>
+  </div>
 </div>
 
 <div class="main">

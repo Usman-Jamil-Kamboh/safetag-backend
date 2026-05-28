@@ -28,7 +28,9 @@ from PIL import Image, ImageDraw, ImageFont
 
 DATABASE_URL    = os.getenv("DATABASE_URL")
 BASE_URL        = os.getenv("BASE_URL",  "http://localhost:8000")
-ADMIN_KEY       = os.getenv("ADMIN_KEY", "pasbaan-admin-2024")
+ADMIN_KEY       = os.getenv("ADMIN_KEY")
+if not ADMIN_KEY:
+    raise RuntimeError("ADMIN_KEY environment variable is not set.")
 
 
 if not DATABASE_URL:
@@ -128,7 +130,10 @@ from contextlib import asynccontextmanager
 import threading
 
 def _bg_init_db(retries: int = 15, delay: float = 3.0):
-    """Run init_db in a background thread so uvicorn is not blocked."""
+    """Run init_pool + init_db in a background thread so uvicorn is not blocked."""
+    # Step 1: create the connection pool
+    init_pool(retries=retries, delay=delay)
+    # Step 2: run schema migrations
     for attempt in range(1, retries + 1):
         try:
             init_db()
@@ -168,13 +173,59 @@ app.add_middleware(PermissionsPolicyMiddleware)
 # DATABASE
 # ─────────────────────────────────────────────────────────────────────────────
 
+from psycopg2 import pool as _pg_pool
+
+_db_pool: "_pg_pool.ThreadedConnectionPool | None" = None
+
+
+def init_pool(retries: int = 10, delay: float = 3.0):
+    """Create the global connection pool. Retried in background at startup."""
+    global _db_pool
+    for attempt in range(1, retries + 1):
+        try:
+            _db_pool = _pg_pool.ThreadedConnectionPool(
+                minconn=2,
+                maxconn=10,          # safe for Supabase free tier (max ~20)
+                dsn=DATABASE_URL,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+                connect_timeout=10,
+            )
+            print("[Pasbaan] Connection pool created.", file=sys.stderr)
+            return
+        except Exception as e:
+            print(f"[Pasbaan] Pool init attempt {attempt}/{retries} failed: {e}", file=sys.stderr)
+            if attempt < retries:
+                time.sleep(delay)
+    print("[Pasbaan] WARNING: Could not create DB pool after all retries.", file=sys.stderr)
+
+
 def get_db():
-    conn = psycopg2.connect(
-        DATABASE_URL,
-        cursor_factory=psycopg2.extras.RealDictCursor,
-        connect_timeout=10,          # fail fast if DB unreachable
-    )
-    return conn
+    """Borrow a connection from the pool."""
+    if _db_pool is None:
+        # Fallback for edge cases during startup
+        return psycopg2.connect(
+            DATABASE_URL,
+            cursor_factory=psycopg2.extras.RealDictCursor,
+            connect_timeout=10,
+        )
+    return _db_pool.getconn()
+
+
+def release_db(conn):
+    """Return a connection to the pool (or close it if pool is gone)."""
+    if _db_pool is None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
+    try:
+        _db_pool.putconn(conn)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def init_db():
@@ -237,7 +288,7 @@ def init_db():
     conn.commit()
 
     cur.close()
-    conn.close()
+    release_db(conn)
 
 # DB init runs inside FastAPI lifespan so uvicorn starts immediately
 
@@ -255,7 +306,7 @@ def db_next_seq() -> int:
     num = row["next_num"] - 1   # subtract 1 to get the value BEFORE increment
     conn.commit()
     cur.close()
-    conn.close()
+    release_db(conn)
     return num
 
 
@@ -265,7 +316,7 @@ def db_get_record(qr_id: str):
     cur.execute("SELECT * FROM qr_codes WHERE qr_id = %s", (qr_id,))
     row = cur.fetchone()
     cur.close()
-    conn.close()
+    release_db(conn)
     return dict(row) if row else None
 
 
@@ -275,7 +326,7 @@ def db_increment_scan(qr_id: str):
     cur.execute("UPDATE qr_codes SET scan_count = scan_count + 1 WHERE qr_id = %s", (qr_id,))
     conn.commit()
     cur.close()
-    conn.close()
+    release_db(conn)
 
 
 def db_save_owner(qr_id: str, payload: dict, pin_hash: str):
@@ -287,7 +338,7 @@ def db_save_owner(qr_id: str, payload: dict, pin_hash: str):
     )
     conn.commit()
     cur.close()
-    conn.close()
+    release_db(conn)
 
 
 def db_insert_qr(qr_id: str, theme: str = "classic"):
@@ -296,7 +347,7 @@ def db_insert_qr(qr_id: str, theme: str = "classic"):
     cur.execute("INSERT INTO qr_codes (qr_id, theme) VALUES (%s, %s)", (qr_id, theme))
     conn.commit()
     cur.close()
-    conn.close()
+    release_db(conn)
 
 
 def db_list_all(page: int = 1, per_page: int = 25):
@@ -313,7 +364,7 @@ def db_list_all(page: int = 1, per_page: int = 25):
     cur.execute("SELECT COUNT(*) AS cnt FROM qr_codes")
     total = int(cur.fetchone()["cnt"])
     cur.close()
-    conn.close()
+    release_db(conn)
     return [dict(r) for r in rows], total
 
 
@@ -324,7 +375,7 @@ def db_delete_qr(qr_id: str):
     cur.execute("DELETE FROM qr_codes WHERE qr_id = %s", (qr_id,))
     conn.commit()
     cur.close()
-    conn.close()
+    release_db(conn)
 
 
 def db_reset_qr(qr_id: str):
@@ -337,7 +388,7 @@ def db_reset_qr(qr_id: str):
     )
     conn.commit()
     cur.close()
-    conn.close()
+    release_db(conn)
 
 
 
@@ -358,7 +409,7 @@ def db_update_owner(qr_id: str, payload: dict, pin_hash: str = None):
         )
     conn.commit()
     cur.close()
-    conn.close()
+    release_db(conn)
 
 
 def db_stats() -> dict:
@@ -374,7 +425,7 @@ def db_stats() -> dict:
     """)
     row    = cur.fetchone()
     cur.close()
-    conn.close()
+    release_db(conn)
     total  = int(row["total"]  or 0)
     active = int(row["active"] or 0)
     scans  = int(row["scans"]  or 0)
@@ -894,7 +945,7 @@ def admin_sheet(
 ):
     if not is_valid_session(session) and key != ADMIN_KEY:
         raise HTTPException(403, "Not authorised")
-    rows = db_list_all()
+    rows, _ = db_list_all(page=1, per_page=8)
     if not rows:
         raise HTTPException(404, "No QR codes found.")
     codes = [(r["qr_id"], r.get("theme", theme)) for r in rows[:min(limit, 8)]]
@@ -947,10 +998,15 @@ def admin_download_zip(
 # HEALTH
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/admin", status_code=302)
+
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     try:
-        conn = get_db(); conn.close(); db_status = "connected"
+        conn = get_db(); release_db(conn); db_status = "connected"
     except Exception as e:
         db_status = f"error: {e}"
     return {"status": "ok", "database": db_status, "service": "Pasbaan Pakistan v3"}
@@ -1106,7 +1162,7 @@ async def deactivate_qr(qr_id: str, request: Request, pin: str = Form(...)):
         return HTMLResponse(_pin_error_page(qr_id, "Incorrect PIN. QR code not deactivated."))
     conn = get_db(); cur = conn.cursor()
     cur.execute("UPDATE qr_codes SET is_active=FALSE WHERE qr_id=%s", (qr_id,))
-    conn.commit(); cur.close(); conn.close()
+    conn.commit(); cur.close(); release_db(conn)
     resp = HTMLResponse(f"""<!DOCTYPE html><html lang="en">
 <head><meta charset="UTF-8">{_css()}<title>QR Deactivated</title>
 <meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -1136,7 +1192,7 @@ async def activate_qr(qr_id: str, request: Request, pin: str = Form(...)):
         return HTMLResponse(_pin_error_page(qr_id, "Incorrect PIN. QR code not reactivated."))
     conn = get_db(); cur = conn.cursor()
     cur.execute("UPDATE qr_codes SET is_active=TRUE WHERE qr_id=%s", (qr_id,))
-    conn.commit(); cur.close(); conn.close()
+    conn.commit(); cur.close(); release_db(conn)
     return HTMLResponse(f"""<!DOCTYPE html><html lang="en">
 <head><meta charset="UTF-8">{_css()}<title>QR Activated</title>
 <meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -1175,7 +1231,7 @@ async def verify_pin_route(
         # Store PIN for the first time
         conn = get_db(); cur = conn.cursor()
         cur.execute("UPDATE qr_codes SET owner_pin=%s WHERE qr_id=%s", (hash_pin(pin), qr_id))
-        conn.commit(); cur.close(); conn.close()
+        conn.commit(); cur.close(); release_db(conn)
     elif not verify_pin(pin, stored_hash):
         return HTMLResponse(_pin_error_page(qr_id, "Incorrect PIN. Please try again."))
 
@@ -2574,7 +2630,7 @@ def page_success(qr_id: str, name: str) -> str:
 <body><div class="wrap">{_logo()}
 <div class="card" style="text-align:center;padding:40px 20px">
   <div style="font-size:60px;margin-bottom:16px">✅</div>
-  <<h2 style="font-size:22px;font-weight:700;margin-bottom:10px">Pasbaan Activated!</h2>>
+  <h2 style="font-size:22px;font-weight:700;margin-bottom:10px">Pasbaan Activated!</h2>
   <p style="color:#666;font-size:15px;line-height:1.65">
     {name}, your emergency contacts are saved.<br>
     Anyone who scans your sticker will see your contact page instantly.

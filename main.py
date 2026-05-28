@@ -3545,8 +3545,8 @@ def page_admin_subscriptions(rows: list) -> str:
 
         # Pack options dropdown
         pack_options_html = "".join(
-            f'<option value="{label}|{calls}">{label}</option>'
-            for label, calls in PACK_OPTIONS
+            f'<option value="{plabel}|{pcalls}">{plabel}</option>'
+            for plabel, pcalls in PACK_OPTIONS
         )
 
         # Call pack add form — shown inline, expands on click

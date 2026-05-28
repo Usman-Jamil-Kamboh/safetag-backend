@@ -1199,8 +1199,15 @@ def admin_subscriptions(session: str = Cookie(default=None)):
     """Admin page showing all subscriptions with activate/suspend controls."""
     if not is_valid_session(session):
         return RedirectResponse(url="/admin", status_code=302)
-    rows = db_get_all_subscriptions_for_admin()
-    return HTMLResponse(page_admin_subscriptions(rows))
+    try:
+        rows = db_get_all_subscriptions_for_admin()
+        return HTMLResponse(page_admin_subscriptions(rows))
+    except Exception as e:
+        import traceback
+        return HTMLResponse(
+            f"<pre style='color:red;padding:20px'>ERROR:\n{traceback.format_exc()}</pre>",
+            status_code=500
+        )
 
 
 @app.post("/admin/subscriptions/{qr_id}/activate")
@@ -3954,9 +3961,18 @@ def page_admin_subscriptions(rows: list) -> str:
 
     rows_html = ""
     for r in rows:
-        owner = r.get("owner_data") or {}
-        name  = owner.get("owner_name", "—") if owner else "Unclaimed"
-        phone = owner.get("contacts", [{}])[0].get("phone", "—") if owner else "—"
+        # owner_data comes from DB as JSON string — parse it safely
+        _raw = r.get("owner_data")
+        if isinstance(_raw, str):
+            try: owner = json.loads(_raw)
+            except Exception: owner = {}
+        elif isinstance(_raw, dict):
+            owner = _raw
+        else:
+            owner = {}
+        name  = owner.get("owner_name", "Unclaimed") if owner else "Unclaimed"
+        contacts = owner.get("contacts") or [{}]
+        phone = contacts[0].get("phone", "—") if contacts else "—"
         plan  = r.get("plan", "basic")
         status= r.get("status", "pending_payment")
         label, bg, fg = STATUS_STYLE.get(status, (status, "#f5f5f5", "#333"))

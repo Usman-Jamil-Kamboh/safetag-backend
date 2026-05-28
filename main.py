@@ -532,8 +532,10 @@ _FONT_SOURCES = {
         "https://fonts.gstatic.com/s/poppins/v21/pxiEyp8kv8JHgFVrJJfecg.woff2",
     ],
     "DejaVuSansMono-Bold.ttf": [
-        "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSansMono-Bold.ttf",
-        "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSansMono-Bold.ttf",
+        # dompdf mirror — stable, direct TTF download
+        "https://raw.githubusercontent.com/dompdf/dompdf/master/lib/fonts/DejaVuSansMono-Bold.ttf",
+        # Official dejavu-fonts release tarball (v2.37) — fallback
+        "https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-2.37.tar.bz2",
     ],
 }
 
@@ -541,6 +543,8 @@ _FONT_SOURCES = {
 def _ensure_fonts():
     """Download any missing fonts to static/fonts/ (runs once, silently)."""
     import urllib.request
+    import tarfile
+
     for fname, urls in _FONT_SOURCES.items():
         dest = os.path.join(_FONTS_DIR, fname)
         if os.path.exists(dest) and os.path.getsize(dest) > 10_000:
@@ -548,14 +552,27 @@ def _ensure_fonts():
         for url in urls:
             try:
                 print(f"[Pasbaan] Downloading font {fname} from {url} …", file=sys.stderr)
-                urllib.request.urlretrieve(url, dest)
-                size = os.path.getsize(dest)
+                # Handle .tar.bz2 release archives — extract just the one font file
+                if url.endswith(".tar.bz2"):
+                    tmp = dest + ".tar.bz2"
+                    urllib.request.urlretrieve(url, tmp)
+                    with tarfile.open(tmp, "r:bz2") as tar:
+                        for member in tar.getmembers():
+                            if member.name.endswith(fname):
+                                member.name = os.path.basename(member.name)
+                                tar.extract(member, _FONTS_DIR)
+                                break
+                    os.remove(tmp)
+                else:
+                    urllib.request.urlretrieve(url, dest)
+                size = os.path.getsize(dest) if os.path.exists(dest) else 0
                 if size > 10_000:
                     print(f"[Pasbaan] Font {fname} ready ({size} bytes)", file=sys.stderr)
                     break  # success — move on to next font
                 else:
                     print(f"[Pasbaan] Font {fname} too small ({size}b), trying next URL", file=sys.stderr)
-                    os.remove(dest)
+                    if os.path.exists(dest):
+                        os.remove(dest)
             except Exception as e:
                 print(f"[Pasbaan] WARNING: {fname} from {url} failed: {e}", file=sys.stderr)
         else:

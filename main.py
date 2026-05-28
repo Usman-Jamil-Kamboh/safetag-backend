@@ -53,24 +53,6 @@ SESSION_HOURS = 8
 
 # Secret used to sign owner-session cookies (pin verified tokens)
 PIN_COOKIE_SECRET = os.getenv("PIN_COOKIE_SECRET", secrets.token_hex(32))
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MANUAL PAYMENT CONFIG  (update these in Render environment variables)
-# ─────────────────────────────────────────────────────────────────────────────
-OWNER_JAZZCASH   = os.getenv("OWNER_JAZZCASH",   "03XX-XXXXXXX")   # your JazzCash number
-OWNER_EASYPAISA  = os.getenv("OWNER_EASYPAISA",  "03XX-XXXXXXX")   # your Easypaisa number
-OWNER_WHATSAPP   = os.getenv("OWNER_WHATSAPP",   "923XXXXXXXXX")   # your WhatsApp (no +, no dashes)
-OWNER_NAME       = os.getenv("OWNER_NAME",        "Pasbaan Support")
-
-SUBSCRIPTION_PRICE = 399   # PKR per 6 months
-
-# Call pack definitions: label -> (calls, price_pkr)
-CALL_PACKS = {
-    "starter":  (20,  400),
-    "standard": (50,  1000),
-    "popular":  (100, 2000),
-    "heavy":    (200, 4000),
-}
 # Cookie lasts 2 hours — enough to fill the update form without staying logged in forever
 PIN_SESSION_HOURS = 2
 
@@ -349,22 +331,6 @@ def init_db():
     """)
     conn.commit()
 
-    # 8. Create payments table — tracks manual payment confirmations
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            id           SERIAL    PRIMARY KEY,
-            qr_id        TEXT      NOT NULL,
-            payment_type TEXT      NOT NULL DEFAULT 'subscription',
-            amount_pkr   INTEGER   NOT NULL,
-            method       TEXT      DEFAULT NULL,
-            status       TEXT      NOT NULL DEFAULT 'pending',
-            confirmed_at TIMESTAMP DEFAULT NULL,
-            notes        TEXT      DEFAULT NULL,
-            created_at   TIMESTAMP NOT NULL DEFAULT NOW()
-        )
-    """)
-    conn.commit()
-
     cur.close()
     release_db(conn)
 
@@ -505,75 +471,20 @@ def db_get_subscription(qr_id: str):
 
 
 def db_create_subscription(qr_id: str, plan: str = "basic"):
-    """
-    Create subscription on activation.
-    Basic  → immediately active, expires 180 days from now (free trial).
-    Premium→ pending_pack until owner buys a call pack.
-    """
-    if plan == "basic":
-        status     = "active"
-        expires_sql = "NOW() + INTERVAL '180 days'"
-    else:
-        status     = "pending_pack"
-        expires_sql = "NULL"
-
+    """Create a trial subscription for a newly activated QR code."""
+    from datetime import datetime, timedelta
+    expires = datetime.utcnow() + timedelta(days=180)   # 6-month trial
     conn = get_db()
     cur  = conn.cursor()
     cur.execute(
-        f"""INSERT INTO subscriptions (qr_id, plan, status, started_at, expires_at)
-           VALUES (%s, %s, %s, NOW(), {expires_sql})
+        """INSERT INTO subscriptions (qr_id, plan, status, started_at, expires_at)
+           VALUES (%s, %s, 'trial', NOW(), %s)
            ON CONFLICT DO NOTHING""",
-        (qr_id, plan, status)
+        (qr_id, plan, expires)
     )
     conn.commit()
     cur.close()
     release_db(conn)
-
-
-def db_activate_subscription(qr_id: str):
-    """Admin manually activates a subscription — sets active + 180 day expiry from now."""
-    conn = get_db()
-    cur  = conn.cursor()
-    cur.execute(
-        """UPDATE subscriptions
-           SET status='active',
-               started_at=NOW(),
-               expires_at=NOW() + INTERVAL '180 days'
-           WHERE qr_id=%s""",
-        (qr_id,)
-    )
-    conn.commit()
-    cur.close()
-    release_db(conn)
-
-
-def db_deactivate_subscription(qr_id: str):
-    """Admin suspends a subscription (e.g. non-payment on renewal)."""
-    conn = get_db()
-    cur  = conn.cursor()
-    cur.execute(
-        "UPDATE subscriptions SET status='suspended' WHERE qr_id=%s",
-        (qr_id,)
-    )
-    conn.commit()
-    cur.close()
-    release_db(conn)
-
-
-def db_get_all_subscriptions_for_admin() -> list:
-    """Return all subscriptions with qr info for admin dashboard."""
-    conn = get_db()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT s.*, q.owner_data, q.scan_count
-        FROM subscriptions s
-        LEFT JOIN qr_codes q ON q.qr_id = s.qr_id
-        ORDER BY s.created_at DESC
-    """)
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close()
-    release_db(conn)
-    return rows
 
 
 def db_get_call_credits(qr_id: str) -> int:
@@ -588,6 +499,104 @@ def db_get_call_credits(qr_id: str) -> int:
     cur.close()
     release_db(conn)
     return int(row["total"]) if row else 0
+
+
+
+def db_add_call_pack(qr_id: str, pack_label: str, calls: int):
+    """Admin manually adds a call pack to a QR ID after payment confirmed."""
+    conn = get_db()
+    cur  = conn.cursor()
+    cur.execute(
+        """INSERT INTO call_packs
+               (qr_id, calls_purchased, calls_remaining, pack_label, purchased_at)
+           VALUES (%s, %s, %s, %s, NOW())""",
+        (qr_id, calls, calls, pack_label)
+    )
+    # If subscription is pending_pack, activate it now
+    cur.execute(
+        """UPDATE subscriptions
+              SET status = 'active',
+                  started_at = NOW(),
+                  expires_at = NOW() + INTERVAL '180 days'
+            WHERE qr_id = %s AND status = 'pending_pack'""",
+        (qr_id,)
+    )
+    conn.commit()
+    cur.close()
+    release_db(conn)
+
+
+def db_get_call_packs_for_qr(qr_id: str) -> list:
+    """Return all call pack rows for a given qr_id."""
+    conn = get_db()
+    cur  = conn.cursor()
+    cur.execute(
+        "SELECT * FROM call_packs WHERE qr_id = %s ORDER BY purchased_at DESC",
+        (qr_id,)
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    release_db(conn)
+    return rows
+
+
+def db_get_all_subscriptions_for_admin() -> list:
+    """Return all subscriptions with owner info and call credits for admin dashboard."""
+    conn = get_db()
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT
+            s.qr_id,
+            s.plan,
+            s.status,
+            s.started_at,
+            s.expires_at,
+            s.created_at,
+            q.owner_data,
+            q.scan_count,
+            COALESCE(cp.total_remaining, 0) AS call_credits
+        FROM subscriptions s
+        LEFT JOIN qr_codes q ON q.qr_id = s.qr_id
+        LEFT JOIN (
+            SELECT qr_id, SUM(calls_remaining) AS total_remaining
+            FROM call_packs GROUP BY qr_id
+        ) cp ON cp.qr_id = s.qr_id
+        ORDER BY s.created_at DESC
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    release_db(conn)
+    return rows
+
+
+def db_activate_subscription(qr_id: str):
+    """Admin manually activates a subscription — sets active + 180 day expiry from now."""
+    conn = get_db()
+    cur  = conn.cursor()
+    cur.execute(
+        """UPDATE subscriptions
+              SET status='active',
+                  started_at=NOW(),
+                  expires_at=NOW() + INTERVAL '180 days'
+            WHERE qr_id=%s""",
+        (qr_id,)
+    )
+    conn.commit()
+    cur.close()
+    release_db(conn)
+
+
+def db_deactivate_subscription(qr_id: str):
+    """Admin suspends a subscription."""
+    conn = get_db()
+    cur  = conn.cursor()
+    cur.execute(
+        "UPDATE subscriptions SET status='suspended' WHERE qr_id=%s",
+        (qr_id,)
+    )
+    conn.commit()
+    cur.close()
+    release_db(conn)
 
 
 def db_stats() -> dict:
@@ -1190,13 +1199,18 @@ def admin_download_zip(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ADMIN — SUBSCRIPTION MANAGEMENT
+# HEALTH
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN — SUBSCRIPTION & CALL PACK MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.get("/admin/subscriptions", response_class=HTMLResponse)
 def admin_subscriptions(session: str = Cookie(default=None)):
-    """Admin page showing all subscriptions with activate/suspend controls."""
+    """Admin page showing all subscriptions with call pack management."""
     if not is_valid_session(session):
         return RedirectResponse(url="/admin", status_code=302)
     try:
@@ -1226,9 +1240,22 @@ async def admin_suspend_subscription(qr_id: str, session: str = Cookie(default=N
     return RedirectResponse(url="/admin/subscriptions", status_code=303)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HEALTH
-# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/admin/subscriptions/{qr_id}/add-pack")
+async def admin_add_call_pack(
+    qr_id:      str,
+    pack_label: str  = Form(...),
+    calls:      int  = Form(...),
+    session:    str  = Cookie(default=None),
+):
+    """Admin manually adds a call pack to an owner after payment confirmed."""
+    if not is_valid_session(session):
+        raise HTTPException(403, "Not authorised")
+    if calls <= 0 or calls > 10000:
+        raise HTTPException(400, "Invalid call count")
+    # Build a clean label if not provided
+    label = pack_label.strip() or f"{calls}-call pack"
+    db_add_call_pack(qr_id, label, calls)
+    return RedirectResponse(url="/admin/subscriptions", status_code=303)
 
 
 @app.get("/", include_in_schema=False)
@@ -1261,47 +1288,10 @@ def scan_qr(qr_id: str, request: Request):
     # Check deactivation AFTER confirming owner_data exists
     if record.get("is_active") is False:
         return Response(content=page_deactivated(qr_id).encode("utf-8"), media_type="text/html; charset=utf-8")
-
-    # Check subscription — auto-expire or pending_pack → show renewal page
-    sub = db_get_subscription(qr_id)
-    if sub:
-        status = sub.get("status", "active")
-        expires_at = sub.get("expires_at")
-        if status == "active" and expires_at:
-            # Auto-expire: mark as expired if past expiry
-            if expires_at < datetime.utcnow():
-                conn = get_db(); cur = conn.cursor()
-                cur.execute("UPDATE subscriptions SET status='expired' WHERE qr_id=%s", (qr_id,))
-                conn.commit(); cur.close(); release_db(conn)
-                status = "expired"
-        if status in ("expired", "suspended", "pending_pack"):
-            return Response(
-                content=page_subscription_expired(qr_id, sub).encode("utf-8"),
-                media_type="text/html; charset=utf-8"
-            )
-
     if isinstance(owner_data, str):
         owner_data = json.loads(owner_data)
     html = page_contact(qr_id, owner_data, record["scan_count"] + 1)
     return Response(content=html.encode("utf-8"), media_type="text/html; charset=utf-8")
-
-
-@app.get("/scan/{qr_id}/buy-pack", response_class=HTMLResponse)
-def buy_pack_page(qr_id: str):
-    """Premium owner reaches this to buy a call pack (first time or top-up)."""
-    record = db_get_record(qr_id)
-    if not record:
-        return Response(content=page_not_found(qr_id).encode("utf-8"),
-                        media_type="text/html; charset=utf-8", status_code=404)
-    owner = record.get("owner_data") or {}
-    if isinstance(owner, str):
-        import json as _json; owner = _json.loads(owner)
-    name = owner.get("owner_name", "") if owner else ""
-    sub  = db_get_subscription(qr_id)
-    if not sub or sub.get("plan") != "premium":
-        return RedirectResponse(url=f"/scan/{qr_id}", status_code=302)
-    first_time = sub.get("status") == "pending_pack"
-    return HTMLResponse(page_buy_call_pack(qr_id, name, first_time=first_time))
 
 
 @app.get("/scan/{qr_id}/choose-plan", response_class=HTMLResponse)
@@ -1471,12 +1461,7 @@ async def save_setup(
         chosen_plan = "basic"
     db_create_subscription(qr_id, chosen_plan)
 
-    if chosen_plan == "basic":
-        # Basic: free trial active — just show success
-        response = HTMLResponse(page_success(qr_id, owner_name.strip(), chosen_plan))
-    else:
-        # Premium: must buy a call pack to unlock masked calling
-        response = HTMLResponse(page_buy_call_pack(qr_id, owner_name.strip(), first_time=True))
+    response = HTMLResponse(page_success(qr_id, owner_name.strip(), chosen_plan))
     response.delete_cookie(f"plan_{qr_id}")
     return response
 
@@ -1931,7 +1916,6 @@ tr:hover td{{background:#1a1a1a}}
     <div class="logo-name">Pas<span class="logo-dot">baan</span> <span style="color:#555;font-weight:400">Admin</span></div>
     <div class="logo-sub">Pasbaan Pakistan Dashboard</div>
   </div>
-  <a href="/admin/subscriptions" class="logout" style="margin-right:8px">💳 Subscriptions</a>
   <a href="/admin/logout" class="logout">Logout</a>
 </div>
 
@@ -3238,438 +3222,42 @@ function sendLocationToOwner() {{
 </body></html>"""
 
 
-def page_payment_instructions(qr_id: str, name: str, plan: str = "basic") -> str:
-    """
-    Shown after setup — tells owner how to pay manually via JazzCash/Easypaisa
-    and WhatsApp you to confirm, so you can activate their subscription.
-    """
-    plan_label = "👑 Premium" if plan == "premium" else "🔵 Basic"
-    plan_color = "#7c3aed" if plan == "premium" else "#166534"
-    plan_bg    = "#faf5ff" if plan == "premium" else "#f0fdf4"
-    plan_border= "#ddd6fe" if plan == "premium" else "#86efac"
-
-    whatsapp_msg = (
-        f"Assalam o Alaikum! Mera naam {name} hai. "
-        f"Main apna Pasbaan sticker {qr_id} ({plan_label.replace(chr(128081)+' ','').replace(chr(128309)+' ','')}) activate karna chahta hoon. "
-        f"Payment screenshot attach kar raha hoon."
-    )
-    import urllib.parse
-    wa_url = f"https://wa.me/{OWNER_WHATSAPP}?text={urllib.parse.quote(whatsapp_msg)}"
-
-    return f"""<!DOCTYPE html><html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Complete Payment — Pasbaan</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-     background:#f0f0eb;min-height:100vh;padding:24px 16px 48px;color:#111}}
-.wrap{{max-width:420px;margin:0 auto}}
-.logo{{text-align:center;padding:8px 0 22px}}
-.logo-name{{font-size:22px;font-weight:700;letter-spacing:-.4px}}
-.logo-dot{{color:#b90a0a}}
-.logo-sub{{font-size:11px;color:#aaa;margin-top:3px;letter-spacing:.05em;text-transform:uppercase}}
-.card{{background:#fff;border-radius:18px;padding:22px 20px;margin-bottom:14px;
-       box-shadow:0 1px 4px rgba(0,0,0,.06)}}
-.step{{display:flex;gap:14px;align-items:flex-start;padding:12px 0;
-       border-bottom:1px solid #f5f5f3}}
-.step:last-child{{border-bottom:none}}
-.step-num{{width:28px;height:28px;border-radius:50%;background:#111;color:#fff;
-           font-size:13px;font-weight:700;display:flex;align-items:center;
-           justify-content:center;flex-shrink:0;margin-top:1px}}
-.step-body{{flex:1}}
-.step-title{{font-size:14px;font-weight:700;color:#111;margin-bottom:4px}}
-.step-desc{{font-size:13px;color:#666;line-height:1.55}}
-.pay-method{{border-radius:12px;padding:14px 16px;margin:10px 0;
-             border:1.5px solid #e5e5e0;background:#fafaf7}}
-.pay-label{{font-size:11px;font-weight:700;text-transform:uppercase;
-            letter-spacing:.07em;color:#aaa;margin-bottom:6px}}
-.pay-number{{font-size:22px;font-weight:800;color:#111;letter-spacing:.02em}}
-.pay-name{{font-size:12px;color:#888;margin-top:3px}}
-.divider-or{{text-align:center;font-size:12px;color:#ccc;
-             margin:8px 0;position:relative}}
-.divider-or::before,.divider-or::after{{content:'';position:absolute;
-  top:50%;width:42%;height:1px;background:#eee}}
-.divider-or::before{{left:0}}.divider-or::after{{right:0}}
-.plan-chip{{display:inline-block;padding:4px 14px;border-radius:20px;
-            font-size:12px;font-weight:700;
-            background:{plan_bg};color:{plan_color};
-            border:1.5px solid {plan_border};margin-bottom:12px}}
-.wa-btn{{display:block;width:100%;padding:15px;border:none;border-radius:13px;
-         background:#25d366;color:#fff;font-size:15px;font-weight:700;
-         text-align:center;text-decoration:none;cursor:pointer;
-         box-shadow:0 4px 14px rgba(37,211,102,.3);font-family:inherit}}
-.wa-btn:active{{opacity:.9}}
-.amount-box{{background:#f5f5f0;border-radius:12px;padding:14px 16px;
-             display:flex;justify-content:space-between;align-items:center;margin:12px 0}}
-.amount-label{{font-size:13px;color:#666}}
-.amount-val{{font-size:24px;font-weight:800;color:#111}}
-.note{{font-size:12px;color:#aaa;text-align:center;margin-top:6px;line-height:1.6}}
-.id-chip{{display:inline-block;background:#f0f0eb;border-radius:8px;
-          padding:3px 10px;font-family:monospace;font-size:13px;
-          color:#555;font-weight:600}}
-</style>
-</head>
-<body><div class="wrap">
-
-  <div class="logo">
-    <div class="logo-name">Pas<span class="logo-dot">baan</span></div>
-    <div class="logo-sub">Vehicle Emergency System</div>
-  </div>
-
-  <!-- Success header -->
-  <div class="card" style="text-align:center;padding:26px 20px 22px">
-    <div style="font-size:52px;margin-bottom:12px">✅</div>
-    <div class="plan-chip">{plan_label}</div>
-    <h2 style="font-size:20px;font-weight:800;margin-bottom:6px">
-      Sticker Activated, {name}!
-    </h2>
-    <p style="font-size:13px;color:#888;line-height:1.6">
-      Your contact page is live. Complete payment below<br>
-      to keep your subscription active after the free period.
-    </p>
-    <div style="margin-top:12px">
-      <span style="font-size:11px;color:#bbb">Sticker ID &nbsp;</span>
-      <span class="id-chip">{qr_id}</span>
-    </div>
-  </div>
-
-  <!-- Payment steps -->
-  <div class="card">
-    <p style="font-size:13px;font-weight:700;color:#111;margin-bottom:14px">
-      Complete your subscription in 2 steps:
-    </p>
-
-    <!-- Step 1: Pay -->
-    <div class="step">
-      <div class="step-num">1</div>
-      <div class="step-body">
-        <div class="step-title">Send Rs. {SUBSCRIPTION_PRICE} via JazzCash or Easypaisa</div>
-        <div class="step-desc">Send the payment to either number below and <strong>take a screenshot</strong> of the confirmation.</div>
-
-        <div class="amount-box">
-          <span class="amount-label">Amount to send</span>
-          <span class="amount-val">Rs. {SUBSCRIPTION_PRICE}</span>
-        </div>
-
-        <div class="pay-method">
-          <div class="pay-label">💚 JazzCash</div>
-          <div class="pay-number">{OWNER_JAZZCASH}</div>
-          <div class="pay-name">{OWNER_NAME}</div>
-        </div>
-        <div class="divider-or">OR</div>
-        <div class="pay-method">
-          <div class="pay-label">🟣 Easypaisa</div>
-          <div class="pay-number">{OWNER_EASYPAISA}</div>
-          <div class="pay-name">{OWNER_NAME}</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Step 2: WhatsApp -->
-    <div class="step">
-      <div class="step-num">2</div>
-      <div class="step-body">
-        <div class="step-title">WhatsApp us the screenshot</div>
-        <div class="step-desc" style="margin-bottom:14px">
-          Send the payment screenshot to our WhatsApp. We activate your subscription within <strong>a few hours</strong> (usually faster).
-        </div>
-        <a href="{wa_url}" target="_blank" class="wa-btn">
-          📲 &nbsp;WhatsApp Screenshot Now
-        </a>
-      </div>
-    </div>
-  </div>
-
-  <!-- Free period note -->
-  <div class="card" style="background:#fefce8;border:1.5px solid #fde68a;padding:16px 18px">
-    <p style="font-size:13px;font-weight:700;color:#854d0e;margin-bottom:5px">
-      ⏳ Your sticker works now — payment just keeps it alive
-    </p>
-    <p style="font-size:12px;color:#92400e;line-height:1.65">
-      Your contact page is already live and anyone can scan it.
-      You have a free period while we verify your payment.
-      We'll WhatsApp you once your subscription is confirmed active.
-    </p>
-  </div>
-
-  <!-- Preview link -->
-  <a href="/scan/{qr_id}"
-     style="display:block;text-align:center;padding:14px;background:#fff;
-            border-radius:13px;font-size:14px;font-weight:600;color:#111;
-            text-decoration:none;box-shadow:0 1px 4px rgba(0,0,0,.06);margin-top:2px">
-    Preview my contact page →
-  </a>
-
-  <p class="note" style="margin-top:16px">
-    Questions? WhatsApp us anytime at {OWNER_WHATSAPP}<br>
-    Pasbaan Pakistan · Secure Vehicle Emergency System
-  </p>
-
-</div></body></html>"""
-
-
 def page_success(qr_id: str, name: str, plan: str = "basic") -> str:
-    """Shown to Basic plan owner after activation — free 6-month trial confirmed."""
-    from datetime import datetime, timedelta
-    expiry = (datetime.utcnow() + timedelta(days=180)).strftime("%d %B %Y")
+    plan_badge = (
+        '<div style="display:inline-block;margin-bottom:14px;padding:5px 16px;'
+        'background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;'
+        'border-radius:20px;font-size:12px;font-weight:700;letter-spacing:.05em;">👑 PREMIUM PLAN</div>'
+        if plan == "premium" else
+        '<div style="display:inline-block;margin-bottom:14px;padding:5px 16px;'
+        'background:#f0fdf4;color:#166534;border:1.5px solid #86efac;'
+        'border-radius:20px;font-size:12px;font-weight:700;">🔵 BASIC PLAN</div>'
+    )
+    plan_note = (
+        "<p style='font-size:12px;color:#7c3aed;margin-top:8px;line-height:1.6'>"
+        "🔒 Premium: Your numbers are private. Call packs coming soon.</p>"
+        if plan == "premium" else
+        "<p style='font-size:12px;color:#166534;margin-top:8px;line-height:1.6'>"
+        "📞 Basic: Your contact numbers are visible to anyone who scans your sticker.</p>"
+    )
     return f"""<!DOCTYPE html><html lang="en">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Activated! — Pasbaan</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-     background:#f0f0eb;min-height:100vh;padding:24px 16px 48px;color:#111}}
-.wrap{{max-width:420px;margin:0 auto}}
-.logo{{text-align:center;padding:8px 0 22px}}
-.logo-name{{font-size:22px;font-weight:700;letter-spacing:-.4px}}
-.logo-dot{{color:#b90a0a}}
-.logo-sub{{font-size:11px;color:#aaa;margin-top:3px;letter-spacing:.05em;text-transform:uppercase}}
-.card{{background:#fff;border-radius:18px;padding:28px 22px;margin-bottom:14px;
-       box-shadow:0 1px 4px rgba(0,0,0,.06)}}
-.info-row{{display:flex;align-items:flex-start;gap:12px;padding:11px 0;
-           border-bottom:1px solid #f5f5f3;font-size:13px;color:#444;line-height:1.5}}
-.info-row:last-child{{border-bottom:none}}
-.info-row .ic{{font-size:18px;flex-shrink:0;margin-top:1px}}
-</style>
-</head>
-<body><div class="wrap">
-  <div class="logo">
-    <div class="logo-name">Pas<span class="logo-dot">baan</span></div>
-    <div class="logo-sub">Vehicle Emergency System</div>
-  </div>
-
-  <div class="card" style="text-align:center;padding:32px 22px 26px">
-    <div style="font-size:56px;margin-bottom:14px">✅</div>
-    <div style="display:inline-block;margin-bottom:14px;padding:5px 18px;
-                background:#f0fdf4;color:#166534;border:1.5px solid #86efac;
-                border-radius:20px;font-size:12px;font-weight:700">🔵 BASIC PLAN</div>
-    <h2 style="font-size:21px;font-weight:800;margin-bottom:8px">You're all set, {name}!</h2>
-    <p style="font-size:13px;color:#888;line-height:1.65">
-      Your emergency contact page is live.<br>
-      Anyone who scans your sticker can reach you instantly.
-    </p>
-  </div>
-
-  <div class="card">
-    <div class="info-row">
-      <span class="ic">🆓</span>
-      <span><strong>Free for 6 months</strong> — no payment needed. Your sticker works until <strong>{expiry}</strong>.</span>
-    </div>
-    <div class="info-row">
-      <span class="ic">📞</span>
-      <span>Scanners can see your phone numbers and call you directly from their own phone.</span>
-    </div>
-    <div class="info-row">
-      <span class="ic">📍</span>
-      <span>They can also request your live GPS location via WhatsApp.</span>
-    </div>
-    <div class="info-row">
-      <span class="ic">🔔</span>
-      <span>We'll remind you before your free period ends so you never miss a renewal.</span>
-    </div>
-  </div>
-
-  <div style="background:#fef9c3;border:1.5px solid #fde68a;border-radius:14px;
-              padding:14px 16px;margin-bottom:14px;font-size:13px;color:#854d0e;line-height:1.6">
-    <strong>Want full privacy?</strong> Upgrade to Premium anytime to hide your numbers
-    and have scanners call you for free through Pasbaan's masked line.
-  </div>
-
-  <a href="/scan/{qr_id}"
-     style="display:block;text-align:center;padding:15px;background:#111;color:#fff;
-            border-radius:13px;font-size:15px;font-weight:700;text-decoration:none;
-            box-shadow:0 4px 14px rgba(0,0,0,.15)">
-    Preview my contact page →
-  </a>
-  <div style="text-align:center;margin-top:10px">
-    <span style="font-size:11px;color:#bbb">Sticker ID: <code>{qr_id}</code></span>
-  </div>
-</div></body></html>"""
-
-
-def page_buy_call_pack(qr_id: str, name: str = "", first_time: bool = False) -> str:
-    """
-    Shown to Premium owners:
-     - first_time=True  → right after activation (must buy to unlock)
-     - first_time=False → when they run out of call credits
-    """
-    import urllib.parse
-    heading = "Unlock Your Premium Plan" if first_time else "Top Up Your Call Balance"
-    sub = ("Your Premium plan is active — buy a call pack to enable masked calling. "
-           "Your subscription itself is <strong>free for 6 months</strong>."
-           if first_time else
-           "Your call balance has run out. Buy a new pack to re-enable masked calling.")
-    packs = [
-        ("starter",  20,  400,  False),
-        ("standard", 50,  1000, False),
-        ("popular",  100, 2000, True),
-        ("heavy",    200, 4000, False),
-    ]
-    pack_cards = ""
-    for label, calls, price, popular in packs:
-        per_call = round(price / calls)
-        pop_tag  = ('<div style="font-size:10px;font-weight:700;color:#7c3aed;'
-                    'margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em">⭐ Most Popular</div>'
-                    if popular else "")
-        border   = "border-color:#a78bfa;background:linear-gradient(135deg,#faf5ff,#ede9fe)" if popular else ""
-        wa_msg   = (f"Assalam o Alaikum! Main {name or qr_id} hoon. "
-                    f"Main {calls}-call pack (Rs. {price}) khareedna chahta hoon apne Pasbaan sticker {qr_id} ke liye.")
-        wa_url   = f"https://wa.me/{OWNER_WHATSAPP}?text={urllib.parse.quote(wa_msg)}"
-        pack_cards += f"""
-        <div style="background:#fff;border-radius:14px;border:2px solid #e8e8e8;
-                    padding:16px;margin-bottom:10px;{border}">
-          {pop_tag}
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-            <div>
-              <div style="font-size:20px;font-weight:800;color:#111">{calls} calls</div>
-              <div style="font-size:12px;color:#888;margin-top:2px">Rs. {per_call} per call · 2 min each · No expiry</div>
-            </div>
-            <div style="text-align:right">
-              <div style="font-size:22px;font-weight:800;color:#111">Rs. {price:,}</div>
-            </div>
-          </div>
-          <a href="{wa_url}" target="_blank"
-             style="display:block;text-align:center;padding:12px;background:#25d366;color:#fff;
-                    border-radius:10px;font-size:14px;font-weight:700;text-decoration:none">
-            📲 Buy via WhatsApp
-          </a>
-        </div>"""
-
-    return f"""<!DOCTYPE html><html lang="en">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{heading} — Pasbaan</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-     background:#f0f0eb;min-height:100vh;padding:24px 16px 48px;color:#111}}
-.wrap{{max-width:420px;margin:0 auto}}
-.logo{{text-align:center;padding:8px 0 22px}}
-.logo-name{{font-size:22px;font-weight:700;letter-spacing:-.4px}}
-.logo-dot{{color:#b90a0a}}
-.logo-sub{{font-size:11px;color:#aaa;margin-top:3px;letter-spacing:.05em;text-transform:uppercase}}
-</style>
-</head>
-<body><div class="wrap">
-  <div class="logo">
-    <div class="logo-name">Pas<span class="logo-dot">baan</span></div>
-    <div class="logo-sub">Vehicle Emergency System</div>
-  </div>
-
-  <div style="background:#fff;border-radius:18px;padding:24px 20px;margin-bottom:16px;
-              box-shadow:0 1px 4px rgba(0,0,0,.06);text-align:center">
-    <div style="font-size:48px;margin-bottom:12px">👑</div>
-    <div style="display:inline-block;margin-bottom:12px;padding:4px 16px;
-                background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;
-                border-radius:20px;font-size:12px;font-weight:700">PREMIUM PLAN</div>
-    <h2 style="font-size:20px;font-weight:800;margin-bottom:8px">{heading}</h2>
-    <p style="font-size:13px;color:#888;line-height:1.65">{sub}</p>
-    {"" if not name else f'<p style="font-size:11px;color:#bbb;margin-top:8px">Sticker: <code>{qr_id}</code></p>'}
-  </div>
-
-  <div style="background:#f0fdf4;border:1.5px solid #86efac;border-radius:14px;
-              padding:13px 16px;margin-bottom:16px;font-size:13px;color:#166534;line-height:1.6">
-    <strong>How it works:</strong> Send the payment to our JazzCash / Easypaisa number,
-    then WhatsApp us the screenshot. We'll activate your call credits within a few hours.
-    Calls <strong>never expire</strong> — use them at your own pace.
-  </div>
-
-  {pack_cards}
-
-  <div style="background:#fff;border-radius:14px;padding:16px 18px;margin-top:6px;
-              box-shadow:0 1px 4px rgba(0,0,0,.05)">
-    <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;
-              color:#bbb;margin-bottom:10px">Payment Details</p>
-    <p style="font-size:14px;color:#374151;margin-bottom:4px">
-      💚 <strong>JazzCash:</strong> {OWNER_JAZZCASH}</p>
-    <p style="font-size:14px;color:#374151;margin-bottom:4px">
-      🟣 <strong>Easypaisa:</strong> {OWNER_EASYPAISA}</p>
-    <p style="font-size:12px;color:#aaa;margin-top:8px">{OWNER_NAME}</p>
-  </div>
-
-  <p style="font-size:11px;color:#bbb;text-align:center;margin-top:16px;line-height:1.6">
-    Pasbaan Pakistan · Your numbers stay private forever
+<head><meta charset="UTF-8">{_css()}<title>Activated!</title></head>
+<body><div class="wrap">{_logo()}
+<div class="card" style="text-align:center;padding:40px 20px">
+  <div style="font-size:60px;margin-bottom:16px">✅</div>
+  {plan_badge}
+  <h2 style="font-size:22px;font-weight:700;margin-bottom:10px">Pasbaan Activated!</h2>
+  <p style="color:#666;font-size:15px;line-height:1.65">
+    {name}, your emergency contacts are saved.<br>
+    Anyone who scans your sticker will see your contact page instantly.
   </p>
-</div></body></html>"""
-
-
-def page_subscription_expired(qr_id: str, sub: dict) -> str:
-    """
-    Shown when a QR scan hits an expired/suspended/pending_pack subscription.
-    Different message depending on status and plan.
-    """
-    import urllib.parse
-    plan   = sub.get("plan", "basic")
-    status = sub.get("status", "expired")
-
-    if status == "pending_pack":
-        # Premium owner never bought a call pack — redirect them to buy page
-        # (scanner sees a holding message, owner sees buy page via their own scan)
-        icon    = "👑"
-        heading = "Premium Activation Pending"
-        body    = ("The owner of this vehicle has a Premium Pasbaan sticker but has not yet activated their call pack. "
-                   "You can try contacting them via WhatsApp if their number was shared.")
-        owner_action = f'<a href="/scan/{qr_id}/buy-pack" style="display:block;margin-top:16px;padding:14px;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;border-radius:13px;font-size:14px;font-weight:700;text-decoration:none;text-align:center">👑 Activate My Pack →</a>'
-    elif status == "expired":
-        icon    = "⏰"
-        heading = "Free Trial Ended"
-        body    = ("This vehicle's Pasbaan sticker free trial has expired. "
-                   "The owner needs to renew their subscription to re-enable this page.")
-        wa_msg  = f"Assalam o Alaikum! Mera Pasbaan sticker {qr_id} expire ho gaya hai. Renew karna chahta hoon."
-        wa_url  = f"https://wa.me/{OWNER_WHATSAPP}?text={urllib.parse.quote(wa_msg)}"
-        owner_action = f'<a href="{wa_url}" target="_blank" style="display:block;margin-top:16px;padding:14px;background:#25d366;color:#fff;border-radius:13px;font-size:14px;font-weight:700;text-decoration:none;text-align:center">📲 Renew via WhatsApp</a>'
-    else:
-        icon    = "🚫"
-        heading = "Subscription Suspended"
-        body    = "This vehicle's Pasbaan subscription has been suspended."
-        owner_action = ""
-
-    return f"""<!DOCTYPE html><html lang="en">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{heading} — Pasbaan</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-     background:#f0f0eb;min-height:100vh;padding:24px 16px 48px;color:#111}}
-.wrap{{max-width:420px;margin:0 auto}}
-.logo{{text-align:center;padding:8px 0 22px}}
-.logo-name{{font-size:22px;font-weight:700;letter-spacing:-.4px}}
-.logo-dot{{color:#b90a0a}}
-.logo-sub{{font-size:11px;color:#aaa;margin-top:3px;letter-spacing:.05em;text-transform:uppercase}}
-</style>
-</head>
-<body><div class="wrap">
-  <div class="logo">
-    <div class="logo-name">Pas<span class="logo-dot">baan</span></div>
-    <div class="logo-sub">Vehicle Emergency System</div>
+  {plan_note}
+  <div style="margin-top:22px;background:#f5f5f0;padding:14px;border-radius:12px">
+    <p style="font-size:12px;color:#aaa;margin-bottom:4px">Your Sticker ID</p>
+    <code style="font-size:17px;font-weight:700">{qr_id}</code>
   </div>
-
-  <div style="background:#fff;border-radius:18px;padding:32px 22px;margin-bottom:16px;
-              box-shadow:0 1px 4px rgba(0,0,0,.06);text-align:center">
-    <div style="font-size:52px;margin-bottom:14px">{icon}</div>
-    <h2 style="font-size:20px;font-weight:800;margin-bottom:10px">{heading}</h2>
-    <p style="font-size:13px;color:#888;line-height:1.7">{body}</p>
-    <p style="font-size:11px;color:#ccc;margin-top:10px">Sticker: <code>{qr_id}</code></p>
-    {owner_action}
-  </div>
-
-  <div style="background:#fff;border-radius:14px;padding:16px 18px;
-              box-shadow:0 1px 4px rgba(0,0,0,.05);text-align:center">
-    <p style="font-size:13px;color:#666;margin-bottom:12px;line-height:1.6">
-      🚨 In case of emergency, contact these Pakistan helplines:
-    </p>
-    <p style="font-size:15px;font-weight:700;color:#dc2626;margin-bottom:6px">Rescue 1122</p>
-    <p style="font-size:15px;font-weight:700;color:#dc2626;margin-bottom:6px">Police 15</p>
-    <p style="font-size:15px;font-weight:700;color:#dc2626">Edhi Foundation 115</p>
-  </div>
-
-  <p style="font-size:11px;color:#bbb;text-align:center;margin-top:16px;line-height:1.6">
-    Pasbaan Pakistan · Secure Vehicle Emergency System
-  </p>
+</div>
+<a href="/scan/{qr_id}" class="btn btn-ghost" style="display:block;text-align:center;text-decoration:none">
+  Preview my contact page →</a>
 </div></body></html>"""
 
 
@@ -3874,6 +3462,338 @@ def page_update_success(qr_id: str, name: str) -> str:
 </div></body></html>"""
 
 
+def page_admin_subscriptions(rows: list) -> str:
+    """Admin subscriptions page with inline call pack management per owner."""
+    import json as _json
+
+    STATUS_STYLE = {
+        "active":       ("✅ Active",        "#d1fae5", "#065f46"),
+        "pending_pack": ("📦 Awaiting Pack", "#fef9c3", "#854d0e"),
+        "expired":      ("⏰ Expired",       "#fee2e2", "#991b1b"),
+        "suspended":    ("🚫 Suspended",     "#fee2e2", "#991b1b"),
+        "trial":        ("🆓 Trial",         "#dbeafe", "#1e40af"),
+    }
+
+    PACK_OPTIONS = [
+        ("20 calls — Rs. 400",   20),
+        ("50 calls — Rs. 1,000", 50),
+        ("100 calls — Rs. 2,000", 100),
+        ("200 calls — Rs. 4,000", 200),
+    ]
+
+    rows_html = ""
+    for r in rows:
+        _raw = r.get("owner_data")
+        if isinstance(_raw, str):
+            try: owner = _json.loads(_raw)
+            except Exception: owner = {}
+        elif isinstance(_raw, dict):
+            owner = _raw
+        else:
+            owner = {}
+
+        name  = owner.get("owner_name", "—") if owner else "—"
+        contacts = owner.get("contacts") or []
+        phone = contacts[0].get("phone", "—") if contacts else "—"
+        plan  = r.get("plan", "basic")
+        status= r.get("status", "trial")
+        label, bg, fg = STATUS_STYLE.get(status, (status, "#f5f5f5", "#333"))
+        qr_id = r["qr_id"]
+        exp   = r.get("expires_at")
+        exp_str = exp.strftime("%d %b %Y") if exp else "—"
+        credits = int(r.get("call_credits", 0))
+
+        plan_badge = (
+            f'<span style="background:#ede9fe;color:#6d28d9;padding:2px 9px;'
+            f'border-radius:12px;font-size:11px;font-weight:700;">👑 Premium</span>'
+            if plan == "premium" else
+            f'<span style="background:#d1fae5;color:#065f46;padding:2px 9px;'
+            f'border-radius:12px;font-size:11px;font-weight:700;">🔵 Basic</span>'
+        )
+        status_badge = (
+            f'<span style="background:{bg};color:{fg};padding:2px 9px;'
+            f'border-radius:12px;font-size:11px;font-weight:600;">{label}</span>'
+        )
+
+        # Call credits badge
+        credits_badge = ""
+        if plan == "premium":
+            cred_bg  = "#f0fdf4" if credits > 0 else "#fef2f2"
+            cred_fg  = "#166534" if credits > 0 else "#9f1239"
+            cred_border = "#86efac" if credits > 0 else "#fecaca"
+            credits_badge = (
+                f'<span style="background:{cred_bg};color:{cred_fg};'
+                f'border:1px solid {cred_border};padding:2px 9px;'
+                f'border-radius:12px;font-size:11px;font-weight:700;'
+                f'display:inline-block;margin-top:4px;">📞 {credits} calls left</span>'
+            )
+
+        # Activate / Suspend buttons
+        activate_btn = (
+            f'<form method="POST" action="/admin/subscriptions/{qr_id}/activate" style="display:inline">'
+            f'<button type="submit" class="act-btn act-green">✅ Activate</button></form>'
+            if status != "active" else ""
+        )
+        suspend_btn = (
+            f'<form method="POST" action="/admin/subscriptions/{qr_id}/suspend" style="display:inline">'
+            f'<button type="submit" class="act-btn act-red">🚫 Suspend</button></form>'
+            if status == "active" else ""
+        )
+
+        # Pack options dropdown
+        pack_options_html = "".join(
+            f'<option value="{label}|{calls}">{label}</option>'
+            for label, calls in PACK_OPTIONS
+        )
+
+        # Call pack add form — shown inline, expands on click
+        pack_form = ""
+        if plan == "premium":
+            pack_form = f"""
+            <details style="margin-top:6px">
+              <summary style="font-size:12px;font-weight:700;color:#7c3aed;cursor:pointer;
+                              padding:5px 0;list-style:none;display:flex;align-items:center;gap:5px">
+                ➕ Add Call Pack
+              </summary>
+              <form method="POST" action="/admin/subscriptions/{qr_id}/add-pack"
+                    style="margin-top:8px;background:#faf5ff;border:1.5px solid #ddd6fe;
+                           border-radius:10px;padding:12px;">
+                <div style="font-size:11px;font-weight:700;color:#7c3aed;margin-bottom:8px;
+                            text-transform:uppercase;letter-spacing:.06em">
+                  Add Calls for {qr_id}
+                </div>
+                <!-- Preset packs -->
+                <div style="margin-bottom:8px">
+                  <label style="font-size:12px;color:#6b7280;margin-bottom:4px;display:block">
+                    Quick Select Pack
+                  </label>
+                  <select name="_preset" id="preset_{qr_id}"
+                          onchange="applyPreset(this, '{qr_id}')"
+                          style="width:100%;padding:8px 10px;border-radius:8px;
+                                 border:1.5px solid #ddd6fe;font-size:13px;
+                                 background:#fff;color:#111;font-family:inherit">
+                    <option value="">— Choose a pack —</option>
+                    {pack_options_html}
+                  </select>
+                </div>
+                <!-- OR custom -->
+                <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:10px">
+                  <div style="flex:1">
+                    <label style="font-size:12px;color:#6b7280;margin-bottom:4px;display:block">
+                      Pack Label
+                    </label>
+                    <input type="text" name="pack_label" id="label_{qr_id}"
+                           placeholder="e.g. 20 calls — Rs. 400"
+                           style="width:100%;padding:8px 10px;border-radius:8px;
+                                  border:1.5px solid #e0d9f7;font-size:13px;
+                                  background:#fff;color:#111;font-family:inherit">
+                  </div>
+                  <div style="width:90px">
+                    <label style="font-size:12px;color:#6b7280;margin-bottom:4px;display:block">
+                      # of Calls
+                    </label>
+                    <input type="number" name="calls" id="calls_{qr_id}"
+                           min="1" max="10000" placeholder="20"
+                           style="width:100%;padding:8px 10px;border-radius:8px;
+                                  border:1.5px solid #e0d9f7;font-size:14px;font-weight:700;
+                                  background:#fff;color:#111;font-family:inherit;text-align:center">
+                  </div>
+                </div>
+                <button type="submit"
+                        style="width:100%;padding:10px;background:linear-gradient(135deg,#7c3aed,#6d28d9);
+                               color:#fff;border:none;border-radius:9px;font-size:13px;
+                               font-weight:700;cursor:pointer;font-family:inherit">
+                  ✅ Confirm & Add Pack
+                </button>
+                <p style="font-size:11px;color:#9ca3af;margin-top:6px;line-height:1.5">
+                  Only add after you have confirmed payment on JazzCash / Easypaisa.
+                  If the subscription is <em>Awaiting Pack</em>, it will be auto-activated.
+                </p>
+              </form>
+            </details>"""
+
+        rows_html += f"""
+        <tr id="row-{qr_id}">
+          <td>
+            <div style="font-family:monospace;font-weight:700;font-size:13px;color:#111">{qr_id}</div>
+            <div style="font-size:11px;color:#aaa;margin-top:2px">
+              scans: {r.get("scan_count", 0)}
+            </div>
+          </td>
+          <td>
+            <div style="font-size:14px;font-weight:600;color:#111">{name}</div>
+            <div style="font-size:11px;color:#aaa;margin-top:2px">{phone}</div>
+          </td>
+          <td>
+            {plan_badge}
+            {credits_badge}
+          </td>
+          <td>{status_badge}</td>
+          <td style="font-size:12px;color:#666">{exp_str}</td>
+          <td>
+            <div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:4px">
+              {activate_btn}
+              {suspend_btn}
+              <a href="/scan/{qr_id}" target="_blank" class="act-btn act-ghost">👁 View</a>
+            </div>
+            {pack_form}
+          </td>
+        </tr>"""
+
+    pending_count   = sum(1 for r in rows if r.get("status") in ("pending_pack", "expired"))
+    active_count    = sum(1 for r in rows if r.get("status") == "active")
+    suspended_count = sum(1 for r in rows if r.get("status") == "suspended")
+    low_credits     = sum(1 for r in rows if r.get("plan") == "premium" and int(r.get("call_credits", 0)) == 0)
+
+    alert_html = ""
+    alerts = []
+    if pending_count:
+        alerts.append(
+            f'⚠️ <strong>{pending_count} subscription{"s" if pending_count>1 else ""} need attention</strong> — '
+            f'check JazzCash/Easypaisa and click Activate.'
+        )
+    if low_credits:
+        alerts.append(
+            f'📞 <strong>{low_credits} Premium owner{"s" if low_credits>1 else ""} '
+            f'{"have" if low_credits>1 else "has"} 0 call credits</strong> — '
+            f'add a pack once they pay.'
+        )
+    for a in alerts:
+        alert_html += f'<div class="alert-box">{a}</div>\n'
+
+    return f"""<!DOCTYPE html><html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Subscriptions — Pasbaan Admin</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+     background:#f0f0eb;min-height:100vh;padding:24px 16px 48px;color:#111}}
+.wrap{{max-width:1060px;margin:0 auto}}
+.topbar{{display:flex;align-items:center;justify-content:space-between;
+         background:#111;color:#fff;padding:14px 22px;border-radius:14px;margin-bottom:20px}}
+.topbar-title{{font-size:16px;font-weight:800;letter-spacing:-.3px}}
+.topbar-links{{display:flex;gap:8px}}
+.topbar-links a{{color:#aaa;font-size:13px;text-decoration:none;padding:6px 14px;
+                 border:1px solid #333;border-radius:8px;transition:color .12s,border-color .12s}}
+.topbar-links a:hover{{color:#fff;border-color:#666}}
+.stat-row{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}}
+@media(max-width:600px){{.stat-row{{grid-template-columns:1fr 1fr}}}}
+.stat-card{{background:#fff;border-radius:14px;padding:16px 18px;
+            box-shadow:0 1px 4px rgba(0,0,0,.06)}}
+.stat-label{{font-size:11px;font-weight:700;text-transform:uppercase;
+             letter-spacing:.07em;color:#bbb;margin-bottom:6px}}
+.stat-val{{font-size:28px;font-weight:800;color:#111;line-height:1}}
+.alert-box{{background:#fef9c3;border:1.5px solid #fde68a;border-radius:12px;
+            padding:12px 16px;margin-bottom:12px;font-size:13px;color:#854d0e;line-height:1.6}}
+.card{{background:#fff;border-radius:16px;overflow:hidden;
+       box-shadow:0 1px 4px rgba(0,0,0,.06);margin-bottom:16px}}
+.card-header{{padding:14px 20px;border-bottom:1px solid #f0f0ee;
+              display:flex;align-items:center;justify-content:space-between}}
+.card-title{{font-size:15px;font-weight:700}}
+.table-wrap{{overflow-x:auto}}
+table{{width:100%;border-collapse:collapse}}
+th{{padding:10px 14px;font-size:11px;font-weight:700;text-transform:uppercase;
+    letter-spacing:.06em;color:#999;border-bottom:2px solid #f0f0ee;text-align:left;
+    white-space:nowrap}}
+td{{padding:12px 14px;border-bottom:1px solid #f7f7f5;vertical-align:top}}
+tr:last-child td{{border-bottom:none}}
+tr:hover td{{background:#fafaf7}}
+.act-btn{{padding:5px 11px;border-radius:8px;font-size:12px;font-weight:600;
+          cursor:pointer;text-decoration:none;border:none;font-family:inherit;
+          display:inline-block;transition:opacity .12s}}
+.act-btn:hover{{opacity:.82}}
+.act-green{{background:#111;color:#fff}}
+.act-red{{background:#fee2e2;color:#991b1b;border:1px solid #fecaca}}
+.act-ghost{{background:#f5f5f0;color:#555;border:1px solid #e0e0e0}}
+details summary::-webkit-details-marker{{display:none}}
+</style>
+</head>
+<body><div class="wrap">
+
+  <div class="topbar">
+    <div class="topbar-title">💳 Subscriptions & Call Packs</div>
+    <div class="topbar-links">
+      <a href="/admin">← Dashboard</a>
+      <a href="/admin/logout">Logout</a>
+    </div>
+  </div>
+
+  {alert_html}
+
+  <!-- Stats -->
+  <div class="stat-row">
+    <div class="stat-card">
+      <div class="stat-label">⏳ Needs Action</div>
+      <div class="stat-val" style="color:#d97706">{pending_count}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">✅ Active</div>
+      <div class="stat-val" style="color:#059669">{active_count}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">🚫 Suspended</div>
+      <div class="stat-val" style="color:#dc2626">{suspended_count}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">📞 0 Credits</div>
+      <div class="stat-val" style="color:#7c3aed">{low_credits}</div>
+    </div>
+  </div>
+
+  <!-- How to use -->
+  <div style="background:#eff6ff;border:1.5px solid #93c5fd;border-radius:14px;
+              padding:14px 18px;margin-bottom:16px;font-size:13px;color:#1e40af;line-height:1.7">
+    <strong>How to add a call pack:</strong>
+    After confirming payment on JazzCash/Easypaisa, expand
+    <strong>➕ Add Call Pack</strong> on the relevant row, choose the pack or enter custom calls, then click Confirm.
+    If the subscription was <em>Awaiting Pack</em>, it auto-activates immediately.
+  </div>
+
+  <!-- Table -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">All Subscriptions ({len(rows)})</span>
+      <span style="font-size:12px;color:#aaa">{active_count} active &nbsp;·&nbsp; {pending_count} pending</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Sticker ID</th>
+            <th>Owner</th>
+            <th>Plan / Credits</th>
+            <th>Status</th>
+            <th>Expires</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows_html if rows_html else
+           "<tr><td colspan=\'6\' style=\'text-align:center;color:#aaa;padding:30px\'>No subscriptions yet</td></tr>"}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <p style="font-size:12px;color:#bbb;text-align:center;margin-top:8px">
+    Pasbaan Pakistan Admin · Subscription & Call Pack Management
+  </p>
+</div>
+
+<script>
+function applyPreset(sel, qrId) {{
+  const val = sel.value;
+  if (!val) return;
+  const [label, calls] = val.split('|');
+  document.getElementById('label_' + qrId).value = label;
+  document.getElementById('calls_' + qrId).value = calls;
+}}
+</script>
+</body></html>"""
+
+
 def page_deactivated(qr_id: str) -> str:
     """Shown when a QR code has been temporarily deactivated by its owner."""
     return f"""<!DOCTYPE html><html lang="en">
@@ -3946,176 +3866,6 @@ function rp(v){{
 rpin.addEventListener('input',()=>{{rpin.value=rpin.value.replace(/\\D/g,'').slice(0,4);}});
 rpin.addEventListener('input',()=>{{if(rpin.value.length===4) document.getElementById('react-form').requestSubmit();}});
 </script>
-</div></body></html>"""
-
-
-def page_admin_subscriptions(rows: list) -> str:
-    """Admin subscriptions management page."""
-
-    STATUS_STYLE = {
-        "active":       ("✅ Active",        "#d1fae5", "#065f46"),
-        "pending_pack": ("📦 Awaiting Pack", "#fef9c3", "#854d0e"),
-        "expired":      ("⏰ Expired",       "#fee2e2", "#991b1b"),
-        "suspended":    ("🚫 Suspended",     "#fee2e2", "#991b1b"),
-    }
-
-    rows_html = ""
-    for r in rows:
-        # owner_data comes from DB as JSON string — parse it safely
-        _raw = r.get("owner_data")
-        if isinstance(_raw, str):
-            try: owner = json.loads(_raw)
-            except Exception: owner = {}
-        elif isinstance(_raw, dict):
-            owner = _raw
-        else:
-            owner = {}
-        name  = owner.get("owner_name", "Unclaimed") if owner else "Unclaimed"
-        contacts = owner.get("contacts") or [{}]
-        phone = contacts[0].get("phone", "—") if contacts else "—"
-        plan  = r.get("plan", "basic")
-        status= r.get("status", "pending_payment")
-        label, bg, fg = STATUS_STYLE.get(status, (status, "#f5f5f5", "#333"))
-        qr_id = r["qr_id"]
-        exp   = r.get("expires_at")
-        exp_str = exp.strftime("%d %b %Y") if exp else "—"
-        plan_badge = (
-            f'<span style="background:#ede9fe;color:#6d28d9;padding:2px 9px;'
-            f'border-radius:12px;font-size:11px;font-weight:700;">👑 Premium</span>'
-            if plan == "premium" else
-            f'<span style="background:#d1fae5;color:#065f46;padding:2px 9px;'
-            f'border-radius:12px;font-size:11px;font-weight:700;">🔵 Basic</span>'
-        )
-        status_badge = (
-            f'<span style="background:{bg};color:{fg};padding:2px 9px;'
-            f'border-radius:12px;font-size:11px;font-weight:600;">{label}</span>'
-        )
-        activate_btn = (
-            f'<form method="POST" action="/admin/subscriptions/{qr_id}/activate" style="display:inline">'
-            f'<button type="submit" style="padding:5px 12px;border:none;border-radius:8px;'
-            f'background:#111;color:#fff;font-size:12px;font-weight:600;cursor:pointer;margin-right:5px">'
-            f'✅ Activate</button></form>'
-            if status != "active" else ""
-        )
-        suspend_btn = (
-            f'<form method="POST" action="/admin/subscriptions/{qr_id}/suspend" style="display:inline">'
-            f'<button type="submit" style="padding:5px 12px;border:none;border-radius:8px;'
-            f'background:#fee2e2;color:#991b1b;font-size:12px;font-weight:600;cursor:pointer">'
-            f'🚫 Suspend</button></form>'
-            if status == "active" else ""
-        )
-        rows_html += f"""
-        <tr>
-          <td style="font-family:monospace;font-weight:600;font-size:13px">{qr_id}</td>
-          <td style="font-size:13px">{name}<br><span style="font-size:11px;color:#aaa">{phone}</span></td>
-          <td>{plan_badge}</td>
-          <td>{status_badge}</td>
-          <td style="font-size:12px;color:#666">{exp_str}</td>
-          <td>{activate_btn}{suspend_btn}
-            <a href="/scan/{qr_id}" target="_blank"
-               style="padding:5px 10px;border:1px solid #ddd;border-radius:8px;
-                      font-size:12px;text-decoration:none;color:#555">👁</a>
-          </td>
-        </tr>"""
-
-    pending_count  = sum(1 for r in rows if r.get("status") in ("pending_pack", "expired"))
-    active_count   = sum(1 for r in rows if r.get("status") == "active")
-    suspended_count= sum(1 for r in rows if r.get("status") == "suspended")
-
-    return f"""<!DOCTYPE html><html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Subscriptions — Pasbaan Admin</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-     background:#f0f0eb;min-height:100vh;padding:24px 16px 48px;color:#111}}
-.wrap{{max-width:960px;margin:0 auto}}
-.topbar{{display:flex;align-items:center;justify-content:space-between;
-         background:#111;color:#fff;padding:12px 20px;border-radius:14px;margin-bottom:20px}}
-.topbar-title{{font-size:16px;font-weight:700}}
-.topbar a{{color:#aaa;font-size:13px;text-decoration:none;padding:5px 12px;
-           border:1px solid #333;border-radius:8px}}
-.topbar a:hover{{color:#fff;border-color:#666}}
-.stat-row{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}}
-.stat-card{{background:#fff;border-radius:14px;padding:16px 18px;
-            box-shadow:0 1px 4px rgba(0,0,0,.06)}}
-.stat-label{{font-size:11px;font-weight:700;text-transform:uppercase;
-             letter-spacing:.07em;color:#aaa;margin-bottom:6px}}
-.stat-val{{font-size:28px;font-weight:800;color:#111}}
-.card{{background:#fff;border-radius:16px;overflow:hidden;
-       box-shadow:0 1px 4px rgba(0,0,0,.06);margin-bottom:16px}}
-.card-header{{padding:16px 20px;border-bottom:1px solid #f0f0ee;
-              display:flex;align-items:center;justify-content:space-between}}
-.card-title{{font-size:15px;font-weight:700}}
-table{{width:100%;border-collapse:collapse}}
-th{{padding:10px 14px;font-size:11px;font-weight:700;text-transform:uppercase;
-    letter-spacing:.06em;color:#999;border-bottom:2px solid #f0f0ee;text-align:left}}
-td{{padding:12px 14px;border-bottom:1px solid #f7f7f5;vertical-align:middle}}
-tr:last-child td{{border-bottom:none}}
-tr:hover td{{background:#fafaf7}}
-.alert{{background:#fef9c3;border:1.5px solid #fde68a;border-radius:12px;
-        padding:12px 16px;margin-bottom:16px;font-size:13px;color:#854d0e}}
-</style>
-</head>
-<body><div class="wrap">
-
-  <div class="topbar">
-    <div class="topbar-title">💳 Subscriptions</div>
-    <div style="display:flex;gap:8px">
-      <a href="/admin">← Dashboard</a>
-      <a href="/admin/logout">Logout</a>
-    </div>
-  </div>
-
-  {"" if not pending_count else
-    f'<div class="alert">⚠️ <strong>{pending_count} subscription{"s" if pending_count>1 else ""} waiting for payment confirmation.</strong> '
-    f'Check your JazzCash / Easypaisa and WhatsApp, then click Activate.</div>'}
-
-  <!-- Stats -->
-  <div class="stat-row">
-    <div class="stat-card">
-      <div class="stat-label">⏳ Pending</div>
-      <div class="stat-val" style="color:#d97706">{pending_count}</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">✅ Active</div>
-      <div class="stat-val" style="color:#059669">{active_count}</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">🚫 Suspended</div>
-      <div class="stat-val" style="color:#dc2626">{suspended_count}</div>
-    </div>
-  </div>
-
-  <!-- Table -->
-  <div class="card">
-    <div class="card-header">
-      <span class="card-title">All Subscriptions ({len(rows)} total)</span>
-    </div>
-    <div style="overflow-x:auto">
-      <table>
-        <thead>
-          <tr>
-            <th>Sticker ID</th>
-            <th>Owner</th>
-            <th>Plan</th>
-            <th>Status</th>
-            <th>Expires</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>{rows_html if rows_html else
-          "<tr><td colspan='6' style='text-align:center;color:#aaa;padding:30px'>No subscriptions yet</td></tr>"}
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <p style="font-size:12px;color:#bbb;text-align:center;margin-top:8px">
-    Pasbaan Pakistan Admin · Subscription Management
-  </p>
 </div></body></html>"""
 
 

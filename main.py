@@ -1290,7 +1290,15 @@ def scan_qr(qr_id: str, request: Request):
         return Response(content=page_deactivated(qr_id).encode("utf-8"), media_type="text/html; charset=utf-8")
     if isinstance(owner_data, str):
         owner_data = json.loads(owner_data)
-    html = page_contact(qr_id, owner_data, record["scan_count"] + 1)
+    # Fetch subscription info for premium call-credits checkpoint
+    sub = db_get_subscription(qr_id)
+    call_credits = 0
+    plan = "basic"
+    if sub:
+        plan = sub.get("plan", "basic")
+        if plan == "premium":
+            call_credits = db_get_call_credits(qr_id)
+    html = page_contact(qr_id, owner_data, record["scan_count"] + 1, plan=plan, call_credits=call_credits)
     return Response(content=html.encode("utf-8"), media_type="text/html; charset=utf-8")
 
 
@@ -1464,6 +1472,16 @@ async def save_setup(
     response = HTMLResponse(page_success(qr_id, owner_name.strip(), chosen_plan))
     response.delete_cookie(f"plan_{qr_id}")
     return response
+
+
+@app.get("/scan/{qr_id}/buy-calls", response_class=HTMLResponse)
+def buy_calls_page(qr_id: str):
+    """Public page shown when a Premium owner has run out of call credits."""
+    record = db_get_record(qr_id)
+    if not record or not record["owner_data"]:
+        return Response(content=page_not_found(qr_id).encode("utf-8"),
+                        media_type="text/html; charset=utf-8", status_code=404)
+    return HTMLResponse(page_buy_calls(qr_id))
 
 
 @app.post("/scan/{qr_id}/deactivate", response_class=HTMLResponse)
@@ -2683,12 +2701,146 @@ def _to_intl(phone: str) -> str:
     return "+" + digits
 
 
-def page_contact(qr_id: str, data: dict, scan_count: int) -> str:
+def page_buy_calls(qr_id: str) -> str:
+    """
+    Public page shown when the owner (Premium) has 0 call credits.
+    Displays the available call packs and JazzCash/Easypaisa payment instructions.
+    """
+    PACK_OPTIONS = [
+        ("20 calls",  "Rs. 400"),
+        ("50 calls",  "Rs. 1,000"),
+        ("100 calls", "Rs. 2,000"),
+        ("200 calls", "Rs. 4,000"),
+    ]
+    pack_cards = "".join(
+        f"""<div style="background:#faf5ff;border:1.5px solid #ddd6fe;border-radius:12px;
+                        padding:14px 16px;text-align:center;">
+              <div style="font-size:16px;font-weight:800;color:#6d28d9">{calls}</div>
+              <div style="font-size:14px;color:#7c3aed;font-weight:700;margin-top:4px">{price}</div>
+              <div style="font-size:11px;color:#9ca3af;margin-top:3px">No expiry</div>
+            </div>"""
+        for calls, price in PACK_OPTIONS
+    )
+    return f"""<!DOCTYPE html><html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Buy Call Pack — Pasbaan</title>
+{_css()}
+</head>
+<body><div class="wrap">{_logo()}
+
+<div class="card" style="background:linear-gradient(135deg,#faf5ff,#ede9fe);
+     border:1.5px solid #a78bfa;text-align:center;padding:28px 20px;">
+  <div style="font-size:52px;margin-bottom:12px">📦</div>
+  <h2 style="font-size:20px;font-weight:800;color:#5b21b6;margin-bottom:6px">
+    Buy a Call Pack
+  </h2>
+  <p style="font-size:13px;color:#7c3aed;line-height:1.65">
+    You have <strong>0 call credits</strong> remaining.<br>
+    Top up your pack to restore masked calling for your Pasbaan sticker.
+  </p>
+  <div style="margin-top:12px;background:rgba(255,255,255,.6);border-radius:10px;
+              padding:8px 14px;display:inline-block;font-family:monospace;font-size:12px;color:#9ca3af">
+    Sticker: {qr_id}
+  </div>
+</div>
+
+<div class="card">
+  <div class="sec-title">📦 Available Call Packs</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px">
+    {pack_cards}
+  </div>
+  <p style="font-size:12px;color:#9ca3af;line-height:1.55;text-align:center">
+    Each call = up to 2 minutes · Packs never expire · Stackable
+  </p>
+</div>
+
+<div class="card" style="border:1.5px solid #fde68a;background:#fefce8;">
+  <div class="sec-title" style="color:#854d0e">💳 How to Pay</div>
+  <div style="font-size:13px;color:#78350f;line-height:1.8">
+    <p style="margin-bottom:10px">Send payment via <strong>JazzCash</strong> or <strong>Easypaisa</strong>:</p>
+    <ol style="padding-left:18px;margin-bottom:14px">
+      <li>Choose your pack from the options above</li>
+      <li>Send the exact amount to our JazzCash / Easypaisa number</li>
+      <li>WhatsApp us your <strong>payment screenshot</strong> and your sticker ID <code style="background:#fef9c3;padding:2px 6px;border-radius:4px">{qr_id}</code></li>
+      <li>We will add your credits within a few hours</li>
+    </ol>
+    <div style="background:#fff;border:1.5px solid #fbbf24;border-radius:12px;
+                padding:14px 16px;text-align:center;">
+      <div style="font-size:11px;color:#b45309;text-transform:uppercase;
+                  letter-spacing:.07em;margin-bottom:5px">Payment &amp; Support WhatsApp</div>
+      <a href="https://wa.me/923001234567?text=Hi%2C%20I%20want%20to%20buy%20a%20call%20pack%20for%20{qr_id}"
+         target="_blank" rel="noopener noreferrer"
+         style="display:inline-flex;align-items:center;gap:8px;padding:11px 22px;
+                background:#16a34a;color:#fff;border-radius:11px;
+                font-size:14px;font-weight:700;text-decoration:none;
+                box-shadow:0 4px 12px rgba(22,163,74,.3);">
+        💬 WhatsApp Pasbaan Support
+      </a>
+      <p style="font-size:11px;color:#9ca3af;margin-top:8px">
+        Include your sticker ID and payment screenshot
+      </p>
+    </div>
+  </div>
+</div>
+
+<div class="card" style="border:1.5px solid #bfdbfe;background:#eff6ff;">
+  <div class="sec-title" style="color:#1e40af">⚡ What Happens Next</div>
+  <p style="font-size:13px;color:#1e40af;line-height:1.8">
+    Once your payment is confirmed, credits are added to your account.
+    Call buttons on your contact page will be restored immediately — no action needed on your end.
+  </p>
+</div>
+
+<a href="/scan/{qr_id}" class="btn btn-ghost"
+   style="display:block;text-align:center;text-decoration:none;margin-top:4px">
+  ← Back to contact page
+</a>
+
+<p class="note" style="margin-top:14px">Pasbaan Pakistan · Premium Plan · {qr_id}</p>
+</div></body></html>"""
+
+
+def page_contact(qr_id: str, data: dict, scan_count: int, plan: str = "basic", call_credits: int = 0) -> str:
     icons  = ["c-green","c-blue","c-amber"]
     emojis = ["📞","📱","☎️"]
+
+    # ── Premium call-credits checkpoint ──────────────────────────────────────
+    # For Premium users, the owner pays per call via call packs.
+    # If they have 0 credits remaining, we block the call buttons and show a
+    # "Buy Calls" prompt instead so the owner knows to top up.
+    premium_no_credits = (plan == "premium" and call_credits <= 0)
+
     buttons = ""
-    for i, c in enumerate(data.get("contacts", [])):
-        buttons += f"""<a href="tel:{_to_intl(c['phone'])}" class="call-btn">
+    if premium_no_credits:
+        # Show a locked-out state instead of real call buttons
+        buttons = f"""
+<div style="background:linear-gradient(135deg,#fff7ed,#ffedd5);
+     border:1.5px solid #fed7aa;border-radius:14px;padding:18px 16px;
+     margin-bottom:10px;text-align:center;">
+  <div style="font-size:40px;margin-bottom:10px">📵</div>
+  <h3 style="font-size:16px;font-weight:700;color:#9a3412;margin-bottom:6px">
+    Calls Temporarily Unavailable
+  </h3>
+  <p style="font-size:13px;color:#c2410c;line-height:1.65;margin-bottom:14px">
+    The vehicle owner is a <strong>Premium</strong> member but has run out of call credits.
+    Direct calling is unavailable until they top up their pack.
+  </p>
+  <a href="/scan/{qr_id}/buy-calls"
+     style="display:inline-block;padding:12px 24px;
+            background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;
+            border-radius:12px;font-size:14px;font-weight:700;text-decoration:none;
+            box-shadow:0 4px 14px rgba(109,40,217,.3);">
+    📦 Buy Call Pack
+  </a>
+  <p style="font-size:11px;color:#ea580c;margin-top:10px;line-height:1.5">
+    If this is an emergency, use the Pakistan emergency numbers below.
+  </p>
+</div>"""
+    else:
+        for i, c in enumerate(data.get("contacts", [])):
+            buttons += f"""<a href="tel:{_to_intl(c['phone'])}" class="call-btn">
           <div class="c-icon {icons[i%3]}">{emojis[i%3]}</div>
           <div><div class="c-rel">Call {c['relation']}</div>
                <div class="c-name">{c['name']}</div></div>
@@ -2697,7 +2849,7 @@ def page_contact(qr_id: str, data: dict, scan_count: int) -> str:
     # Owner direct call card — uses owner's own phone number
     owner_phone = data.get("owner_phone", "") or (data["contacts"][0]["phone"] if data.get("contacts") else "")
     owner_call_card = ""
-    if owner_phone:
+    if owner_phone and not premium_no_credits:
         owner_call_card = f"""
 <div class="card" style="background:linear-gradient(135deg,#1e3a5f 0%,#1d4ed8 100%);border:none;padding:20px;">
   <div class="sec-title" style="color:#bfdbfe;margin-bottom:6px;">📞 Call Vehicle Owner</div>

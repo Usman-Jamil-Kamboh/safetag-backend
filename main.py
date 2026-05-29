@@ -2823,7 +2823,13 @@ body{{
   </div>
 
   <!-- ── PREMIUM PLAN ── -->
-  <div class="plan premium">
+  <div class="plan premium" style="opacity:.72;pointer-events:none;user-select:none;position:relative">
+    <div style="position:absolute;top:14px;right:14px;z-index:10;
+                background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff;
+                font-size:11px;font-weight:800;letter-spacing:.07em;
+                padding:4px 12px;border-radius:20px;box-shadow:0 2px 8px rgba(217,119,6,.35)">
+      🚀 COMING SOON
+    </div>
     <div class="plan-top premium-top">
       <div class="plan-label">
         <span class="plan-pill" style="background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff">👑 PREMIUM</span>
@@ -2888,14 +2894,11 @@ body{{
         Each call = 2 minutes. Buy once, use at your own pace.
       </p>
 
-      <form method="POST" action="/scan/{qr_id}/select-plan">
-        <input type="hidden" name="plan" value="premium">
-        <button type="submit" class="plan-btn"
-          style="background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;
-                 box-shadow:0 4px 16px rgba(109,40,217,.3);">
-          Continue with Premium &rarr;
-        </button>
-      </form>
+      <button type="button" class="plan-btn" disabled
+        style="background:#d1d5db;color:#9ca3af;cursor:not-allowed;
+               box-shadow:none;pointer-events:none;">
+        🚀 Coming Soon
+      </button>
     </div>
   </div>
 

@@ -40,6 +40,12 @@ if not ADMIN_KEY:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set.")
 
+# Payment & support contact details (set in Render environment variables)
+OWNER_JAZZCASH  = os.getenv("OWNER_JAZZCASH",  "03269732204")
+OWNER_EASYPAISA = os.getenv("OWNER_EASYPAISA", "03269732204")
+OWNER_WHATSAPP  = os.getenv("OWNER_WHATSAPP",  "03269732204")
+OWNER_NAME      = os.getenv("OWNER_NAME",      "Pasbaan Support")
+
 os.makedirs("static",    exist_ok=True)
 os.makedirs("templates", exist_ok=True)
 
@@ -1469,7 +1475,11 @@ async def save_setup(
         chosen_plan = "basic"
     db_create_subscription(qr_id, chosen_plan)
 
-    response = HTMLResponse(page_success(qr_id, owner_name.strip(), chosen_plan))
+    if chosen_plan == "premium":
+        # Premium owners go straight to the buy-calls page after activation
+        response = HTMLResponse(page_buy_calls(qr_id, new_activation=True, owner_name=owner_name.strip()))
+    else:
+        response = HTMLResponse(page_success(qr_id, owner_name.strip(), chosen_plan))
     response.delete_cookie(f"plan_{qr_id}")
     return response
 
@@ -2701,96 +2711,218 @@ def _to_intl(phone: str) -> str:
     return "+" + digits
 
 
-def page_buy_calls(qr_id: str) -> str:
+def page_buy_calls(qr_id: str, new_activation: bool = False, owner_name: str = "") -> str:
     """
-    Public page shown when the owner (Premium) has 0 call credits.
-    Displays the available call packs and JazzCash/Easypaisa payment instructions.
+    Shown in two situations:
+      1. new_activation=True  — immediately after Premium owner fills setup form
+      2. new_activation=False — when a Premium owner's credits hit 0 and scanner tries to call
     """
+    # Read from environment variables (set in Render dashboard)
+    JAZZCASH_NUM   = OWNER_JAZZCASH
+    EASYPAISA_NUM  = OWNER_EASYPAISA
+    SUPPORT_NUMBER = OWNER_WHATSAPP
+    # Convert local 03xx format to international 923xx for wa.me link
+    _wa = OWNER_WHATSAPP.strip().lstrip("+")
+    if _wa.startswith("0"):
+        _wa = "92" + _wa[1:]
+    elif not _wa.startswith("92"):
+        _wa = "92" + _wa
+    SUPPORT_WA = _wa
+
     PACK_OPTIONS = [
         ("20 calls",  "Rs. 400"),
         ("50 calls",  "Rs. 1,000"),
         ("100 calls", "Rs. 2,000"),
         ("200 calls", "Rs. 4,000"),
     ]
+
     pack_cards = "".join(
-        f"""<div style="background:#faf5ff;border:1.5px solid #ddd6fe;border-radius:12px;
-                        padding:14px 16px;text-align:center;">
+        f"""<div onclick="selectPack(this, '{calls}', '{price}')"
+               style="background:#faf5ff;border:2px solid #ddd6fe;border-radius:12px;
+                      padding:14px 16px;text-align:center;cursor:pointer;transition:all .15s;"
+               class="pack-card">
               <div style="font-size:16px;font-weight:800;color:#6d28d9">{calls}</div>
               <div style="font-size:14px;color:#7c3aed;font-weight:700;margin-top:4px">{price}</div>
               <div style="font-size:11px;color:#9ca3af;margin-top:3px">No expiry</div>
             </div>"""
         for calls, price in PACK_OPTIONS
     )
+
+    # Header varies depending on context
+    if new_activation:
+        header_html = f"""
+<div class="card" style="background:linear-gradient(135deg,#f0fdf4,#dcfce7);
+     border:1.5px solid #86efac;text-align:center;padding:28px 20px;">
+  <div style="font-size:52px;margin-bottom:12px">✅</div>
+  <div style="display:inline-block;margin-bottom:12px;padding:4px 16px;
+       background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;
+       border-radius:20px;font-size:12px;font-weight:700;letter-spacing:.05em;">👑 PREMIUM PLAN</div>
+  <h2 style="font-size:20px;font-weight:800;color:#166534;margin-bottom:6px">
+    {'Welcome, ' + owner_name + '!' if owner_name else 'Pasbaan Activated!'}
+  </h2>
+  <p style="font-size:13px;color:#166534;line-height:1.65;margin-bottom:6px">
+    Your Pasbaan sticker is now active. 🎉<br>
+    Your 6-month free trial has started — <strong>no payment needed now.</strong>
+  </p>
+  <p style="font-size:13px;color:#15803d;line-height:1.65">
+    To enable <strong>masked calling</strong> right away, buy a call pack below.
+    Your real numbers stay private until someone calls through Pasbaan.
+  </p>
+  <div style="margin-top:12px;background:rgba(255,255,255,.6);border-radius:10px;
+              padding:8px 14px;display:inline-block;font-family:monospace;font-size:12px;color:#9ca3af">
+    Sticker: {qr_id}
+  </div>
+</div>"""
+    else:
+        header_html = f"""
+<div class="card" style="background:linear-gradient(135deg,#faf5ff,#ede9fe);
+     border:1.5px solid #a78bfa;text-align:center;padding:28px 20px;">
+  <div style="font-size:52px;margin-bottom:12px">📵</div>
+  <h2 style="font-size:20px;font-weight:800;color:#5b21b6;margin-bottom:6px">
+    Top Up Call Credits
+  </h2>
+  <p style="font-size:13px;color:#7c3aed;line-height:1.65">
+    Your Pasbaan is on <strong>Premium</strong> but has <strong>0 call credits</strong> left.<br>
+    Buy a pack to restore masked calling instantly.
+  </p>
+  <div style="margin-top:12px;background:rgba(255,255,255,.6);border-radius:10px;
+              padding:8px 14px;display:inline-block;font-family:monospace;font-size:12px;color:#9ca3af">
+    Sticker: {qr_id}
+  </div>
+</div>"""
+
+    wa_text = f"Hi%2C%20I%20want%20to%20buy%20a%20call%20pack%20for%20Pasbaan%20sticker%20{qr_id}"
+
     return f"""<!DOCTYPE html><html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Buy Call Pack — Pasbaan</title>
 {_css()}
+<style>
+.pack-card.selected {{
+  border-color:#7c3aed !important;
+  background:linear-gradient(135deg,#ede9fe,#ddd6fe) !important;
+  box-shadow:0 0 0 3px rgba(124,58,237,.2);
+  transform:scale(1.03);
+}}
+.copy-row {{
+  display:flex;align-items:center;gap:8px;
+  background:#fff;border:1.5px solid #e5e7eb;border-radius:11px;
+  padding:11px 14px;margin-bottom:10px;
+}}
+.copy-val {{
+  flex:1;font-family:monospace;font-size:16px;font-weight:700;color:#111;
+  letter-spacing:.04em;
+}}
+.copy-btn {{
+  padding:7px 14px;background:#111;color:#fff;border:none;border-radius:8px;
+  font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;
+  transition:opacity .15s;flex-shrink:0;
+}}
+.copy-btn:hover {{ opacity:.8 }}
+.copy-btn.copied {{ background:#16a34a; }}
+.step-num {{
+  width:24px;height:24px;border-radius:50%;background:#7c3aed;color:#fff;
+  font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;margin-top:1px;
+}}
+.step-row {{
+  display:flex;gap:12px;align-items:flex-start;
+  padding:10px 0;border-bottom:1px solid #f0f0ee;font-size:13px;color:#374151;line-height:1.55;
+}}
+.step-row:last-child {{ border-bottom:none; }}
+#selected-pack-info {{
+  display:none;background:#f0fdf4;border:1.5px solid #86efac;border-radius:10px;
+  padding:10px 14px;margin-top:10px;font-size:13px;color:#166534;font-weight:600;
+  text-align:center;
+}}
+</style>
 </head>
 <body><div class="wrap">{_logo()}
 
-<div class="card" style="background:linear-gradient(135deg,#faf5ff,#ede9fe);
-     border:1.5px solid #a78bfa;text-align:center;padding:28px 20px;">
-  <div style="font-size:52px;margin-bottom:12px">📦</div>
-  <h2 style="font-size:20px;font-weight:800;color:#5b21b6;margin-bottom:6px">
-    Buy a Call Pack
-  </h2>
-  <p style="font-size:13px;color:#7c3aed;line-height:1.65">
-    You have <strong>0 call credits</strong> remaining.<br>
-    Top up your pack to restore masked calling for your Pasbaan sticker.
-  </p>
-  <div style="margin-top:12px;background:rgba(255,255,255,.6);border-radius:10px;
-              padding:8px 14px;display:inline-block;font-family:monospace;font-size:12px;color:#9ca3af">
-    Sticker: {qr_id}
-  </div>
-</div>
+{header_html}
 
+<!-- Step 1 — Choose pack -->
 <div class="card">
-  <div class="sec-title">📦 Available Call Packs</div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px">
+  <div class="sec-title">📦 Step 1 — Choose Your Pack</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:8px">
     {pack_cards}
   </div>
-  <p style="font-size:12px;color:#9ca3af;line-height:1.55;text-align:center">
-    Each call = up to 2 minutes · Packs never expire · Stackable
+  <div id="selected-pack-info">✅ Selected: <span id="selected-label"></span></div>
+  <p style="font-size:11px;color:#9ca3af;line-height:1.55;text-align:center;margin-top:10px">
+    Each call = up to 2 minutes &nbsp;·&nbsp; Packs never expire &nbsp;·&nbsp; Stackable
   </p>
 </div>
 
+<!-- Step 2 — Send payment -->
 <div class="card" style="border:1.5px solid #fde68a;background:#fefce8;">
-  <div class="sec-title" style="color:#854d0e">💳 How to Pay</div>
-  <div style="font-size:13px;color:#78350f;line-height:1.8">
-    <p style="margin-bottom:10px">Send payment via <strong>JazzCash</strong> or <strong>Easypaisa</strong>:</p>
-    <ol style="padding-left:18px;margin-bottom:14px">
-      <li>Choose your pack from the options above</li>
-      <li>Send the exact amount to our JazzCash / Easypaisa number</li>
-      <li>WhatsApp us your <strong>payment screenshot</strong> and your sticker ID <code style="background:#fef9c3;padding:2px 6px;border-radius:4px">{qr_id}</code></li>
-      <li>We will add your credits within a few hours</li>
-    </ol>
-    <div style="background:#fff;border:1.5px solid #fbbf24;border-radius:12px;
-                padding:14px 16px;text-align:center;">
-      <div style="font-size:11px;color:#b45309;text-transform:uppercase;
-                  letter-spacing:.07em;margin-bottom:5px">Payment &amp; Support WhatsApp</div>
-      <a href="https://wa.me/923001234567?text=Hi%2C%20I%20want%20to%20buy%20a%20call%20pack%20for%20{qr_id}"
-         target="_blank" rel="noopener noreferrer"
-         style="display:inline-flex;align-items:center;gap:8px;padding:11px 22px;
-                background:#16a34a;color:#fff;border-radius:11px;
-                font-size:14px;font-weight:700;text-decoration:none;
-                box-shadow:0 4px 12px rgba(22,163,74,.3);">
-        💬 WhatsApp Pasbaan Support
-      </a>
-      <p style="font-size:11px;color:#9ca3af;margin-top:8px">
-        Include your sticker ID and payment screenshot
-      </p>
+  <div class="sec-title" style="color:#854d0e">💳 Step 2 — Send Payment</div>
+  <p style="font-size:13px;color:#78350f;margin-bottom:14px;line-height:1.6">
+    Send the exact amount to <strong>either</strong> number below via JazzCash or Easypaisa.
+    Tap <strong>Copy</strong> to copy the number instantly.
+  </p>
+
+  <!-- JazzCash -->
+  <div style="margin-bottom:6px">
+    <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;
+                color:#854d0e;margin-bottom:6px;display:flex;align-items:center;gap:6px">
+      <span style="background:#dc2626;color:#fff;padding:2px 9px;border-radius:20px;font-size:10px">JazzCash</span>
+    </div>
+    <div class="copy-row">
+      <span class="copy-val" id="jc-num">{JAZZCASH_NUM}</span>
+      <button class="copy-btn" onclick="copyNum('jc-num', this)">Copy</button>
+    </div>
+  </div>
+
+  <!-- Easypaisa -->
+  <div>
+    <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;
+                color:#854d0e;margin-bottom:6px;display:flex;align-items:center;gap:6px">
+      <span style="background:#22c55e;color:#fff;padding:2px 9px;border-radius:20px;font-size:10px">Easypaisa</span>
+    </div>
+    <div class="copy-row">
+      <span class="copy-val" id="ep-num">{EASYPAISA_NUM}</span>
+      <button class="copy-btn" onclick="copyNum('ep-num', this)">Copy</button>
     </div>
   </div>
 </div>
 
+<!-- Step 3 — Send screenshot -->
 <div class="card" style="border:1.5px solid #bfdbfe;background:#eff6ff;">
-  <div class="sec-title" style="color:#1e40af">⚡ What Happens Next</div>
-  <p style="font-size:13px;color:#1e40af;line-height:1.8">
-    Once your payment is confirmed, credits are added to your account.
-    Call buttons on your contact page will be restored immediately — no action needed on your end.
-  </p>
+  <div class="sec-title" style="color:#1e40af">📸 Step 3 — Send Screenshot on WhatsApp</div>
+  <div style="margin-bottom:14px">
+    <div class="step-row">
+      <div class="step-num">1</div>
+      <div>Take a screenshot of your payment confirmation</div>
+    </div>
+    <div class="step-row">
+      <div class="step-num">2</div>
+      <div>WhatsApp it to us along with your sticker ID:
+        <div class="copy-row" style="margin-top:8px;margin-bottom:0">
+          <span class="copy-val" id="sticker-id">{qr_id}</span>
+          <button class="copy-btn" onclick="copyNum('sticker-id', this)">Copy</button>
+        </div>
+      </div>
+    </div>
+    <div class="step-row">
+      <div class="step-num">3</div>
+      <div>We'll add your credits within a few hours ✅</div>
+    </div>
+  </div>
+
+  <a href="https://wa.me/{SUPPORT_WA}?text={wa_text}"
+     target="_blank" rel="noopener noreferrer"
+     style="display:flex;align-items:center;justify-content:center;gap:10px;
+            padding:14px 20px;background:#16a34a;color:#fff;border-radius:13px;
+            font-size:15px;font-weight:700;text-decoration:none;
+            box-shadow:0 4px 14px rgba(22,163,74,.3);">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347z"/>
+      <path d="M12 0C5.373 0 0 5.373 0 12c0 2.124.558 4.118 1.528 5.843L0 24l6.335-1.508A11.954 11.954 0 0012 24c6.627 0 12-5.373 12-12S18.627 0 12 0zm0 21.818a9.795 9.795 0 01-4.98-1.362l-.357-.214-3.762.895.952-3.667-.234-.374A9.77 9.77 0 012.182 12C2.182 6.57 6.57 2.182 12 2.182S21.818 6.57 21.818 12 17.43 21.818 12 21.818z"/>
+    </svg>
+    WhatsApp {OWNER_NAME} — {SUPPORT_NUMBER}
+  </a>
 </div>
 
 <a href="/scan/{qr_id}" class="btn btn-ghost"
@@ -2799,7 +2931,39 @@ def page_buy_calls(qr_id: str) -> str:
 </a>
 
 <p class="note" style="margin-top:14px">Pasbaan Pakistan · Premium Plan · {qr_id}</p>
-</div></body></html>"""
+</div>
+
+<script>
+function copyNum(elId, btn) {{
+  const val = document.getElementById(elId).textContent.trim();
+  navigator.clipboard.writeText(val).then(() => {{
+    btn.textContent = '✓ Copied';
+    btn.classList.add('copied');
+    setTimeout(() => {{ btn.textContent = 'Copy'; btn.classList.remove('copied'); }}, 2000);
+  }}).catch(() => {{
+    // Fallback for older browsers
+    const ta = document.createElement('textarea');
+    ta.value = val;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    btn.textContent = '✓ Copied';
+    btn.classList.add('copied');
+    setTimeout(() => {{ btn.textContent = 'Copy'; btn.classList.remove('copied'); }}, 2000);
+  }});
+}}
+
+function selectPack(el, calls, price) {{
+  document.querySelectorAll('.pack-card').forEach(c => c.classList.remove('selected'));
+  el.classList.add('selected');
+  document.getElementById('selected-label').textContent = calls + ' — ' + price;
+  document.getElementById('selected-pack-info').style.display = 'block';
+}}
+</script>
+</body></html>"""
 
 
 def page_contact(qr_id: str, data: dict, scan_count: int, plan: str = "basic", call_credits: int = 0) -> str:

@@ -389,6 +389,26 @@ def db_get_record(qr_id: str):
     return dict(row) if row else None
 
 
+def _generate_random_qr_id() -> str:
+    """Random 6-digit sticker ID in the same ST-XXXXXX shape as before (now random, not sequential)."""
+    return f"ST-{secrets.randbelow(1_000_000):06d}"
+
+
+def db_generate_unique_qr_id(max_attempts: int = 25) -> str:
+    """
+    Generate a random sticker ID and verify in the DB that it isn't already
+    in use before handing it back — retries on the (rare) collision instead
+    of ever overwriting an existing sticker.
+    """
+    for _ in range(max_attempts):
+        candidate = _generate_random_qr_id()
+        if db_get_record(candidate) is None:
+            return candidate
+    # Astronomically unlikely with ~1,000,000 possible IDs and only a few
+    # hundred/thousand stickers in circulation — but fail loudly if it ever happens.
+    raise HTTPException(500, "Could not generate a unique sticker ID right now — please try again.")
+
+
 def db_increment_scan(qr_id: str):
     conn = get_db()
     cur  = conn.cursor()
@@ -747,8 +767,7 @@ def db_stats() -> dict:
         SELECT
             (SELECT COUNT(*)                         FROM qr_codes) AS total,
             (SELECT COUNT(*) FROM qr_codes           WHERE activated_at IS NOT NULL) AS active,
-            (SELECT COALESCE(SUM(scan_count),0)      FROM qr_codes) AS scans,
-            (SELECT COALESCE(next_num, 1)            FROM qr_counter WHERE id = 1) AS nxt
+            (SELECT COALESCE(SUM(scan_count),0)      FROM qr_codes) AS scans
     """)
     row    = cur.fetchone()
     cur.close()
@@ -756,13 +775,11 @@ def db_stats() -> dict:
     total  = int(row["total"]  or 0)
     active = int(row["active"] or 0)
     scans  = int(row["scans"]  or 0)
-    nxt    = int(row["nxt"]    or 1)
     return {
         "total":       total,
         "active":      active,
         "unclaimed":   total - active,
         "total_scans": scans,
-        "next_id":     f"ST-{nxt:06d}",
     }
 
 
@@ -1280,28 +1297,55 @@ def admin_generate(
     count: int = 1,
     theme: str = "classic",
     vehicle_type: str = "common",
+    manual_id: str = "",
     session: str = Cookie(default=None),
     key: str = "",
 ):
     """
-    Generate sequential QR codes.
+    Generate QR codes with random, non-sequential IDs (each one is checked
+    against the DB for collisions before use — see db_generate_unique_qr_id).
     Called by admin UI (uses session cookie) or directly (uses ?key=).
     vehicle_type: 'car', 'bike', or 'common' — tags the sticker batch so it
     shows up under the matching tab in the admin panel.
+    manual_id: optional — admin supplies their own custom ID instead of a
+    random one (e.g. to reprint a specific physical sticker). Forces count=1
+    and is rejected if that ID already exists.
     """
     if not is_valid_session(session) and key != ADMIN_KEY:
         raise HTTPException(403, "Not authorised")
-    if not 1 <= count <= 500:
-        raise HTTPException(400, "count must be 1–500")
     if theme not in THEMES:
         theme = "yellow"
     if vehicle_type not in ("car", "bike", "common"):
         vehicle_type = "common"
 
+    manual_id = manual_id.strip().upper()
+
+    if manual_id:
+        if not re.fullmatch(r"[A-Z0-9_-]{3,40}", manual_id):
+            raise HTTPException(
+                400,
+                "Manual ID may only contain letters, numbers, '-' and '_', 3–40 characters long."
+            )
+        if db_get_record(manual_id) is not None:
+            raise HTTPException(409, f"ID '{manual_id}' already exists — choose a different one.")
+        db_insert_qr(manual_id, theme, vehicle_type)
+        return {
+            "generated": 1,
+            "codes": [{
+                "qr_id":        manual_id,
+                "scan_url":     f"{BASE_URL}/scan/{manual_id}",
+                "sticker_url":  f"{BASE_URL}/admin/sticker/{manual_id}",
+                "theme":        theme,
+                "vehicle_type": vehicle_type,
+            }],
+        }
+
+    if not 1 <= count <= 500:
+        raise HTTPException(400, "count must be 1–500")
+
     results = []
     for _ in range(count):
-        num   = db_next_seq()
-        qr_id = f"ST-{num:06d}"
+        qr_id = db_generate_unique_qr_id()
         db_insert_qr(qr_id, theme, vehicle_type)
         results.append({
             "qr_id":        qr_id,
@@ -2173,6 +2217,10 @@ input[type=number]{{width:100%;padding:11px 14px;background:#111;border:1.5px so
   border-radius:10px;font-size:20px;font-weight:600;color:#fff;outline:none;
   transition:border-color .15s}}
 input[type=number]:focus{{border-color:#555}}
+input[type=text]{{width:100%;padding:11px 14px;background:#111;border:1.5px solid #2a2a2a;
+  border-radius:10px;font-size:14px;font-weight:600;color:#fff;outline:none;
+  font-family:inherit;transition:border-color .15s}}
+input[type=text]:focus{{border-color:#555}}
 .theme-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}
 .theme-card{{display:flex;align-items:center;gap:10px;padding:10px 12px;
              background:#111;border:1.5px solid #2a2a2a;border-radius:10px;
@@ -2307,8 +2355,8 @@ tr:hover td{{background:#1a1a1a}}
       <div class="stat-label">Total Scans</div>
     </div>
     <div class="stat">
-      <div class="stat-label" style="margin-bottom:6px">Next QR ID</div>
-      <div class="next-id">{stats['next_id']}</div>
+      <div class="stat-label" style="margin-bottom:6px">ID Type</div>
+      <div class="next-id">🎲 Random</div>
     </div>
   </div>
 
@@ -2334,6 +2382,16 @@ tr:hover td{{background:#1a1a1a}}
         <button type="button" class="vtype-card" data-vtype="car" onclick="selectVType('car')">🚗 Car</button>
         <button type="button" class="vtype-card" data-vtype="bike" onclick="selectVType('bike')">🏍️ Bike</button>
       </div>
+    </div>
+    <div style="margin-top:14px">
+      <label>Manual ID <span style="color:#555;font-weight:400">(optional — leave blank for random)</span></label>
+      <input type="text" id="manual-id" placeholder="e.g. ST-700001" maxlength="40"
+             oninput="this.value = this.value.toUpperCase()">
+      <p style="font-size:11px;color:#555;margin-top:6px;line-height:1.5">
+        Fill this in to print one sticker with your own chosen ID (checked against the
+        database for duplicates first). Leave it empty to auto-generate a random,
+        non-sequential ID for the Quantity above.
+      </p>
     </div>
     <button class="btn-gen" id="gen-btn" onclick="generateCodes()">
       Generate QR Codes ↗
@@ -2400,18 +2458,19 @@ function selectVType(vtype) {{
 
 // ── Generate ──────────────────────────────────────────────────────────────
 async function generateCodes() {{
-  const qty    = parseInt(document.getElementById('qty').value);
-  const btn    = document.getElementById('gen-btn');
-  const msgOk  = document.getElementById('msg-ok');
-  const msgErr = document.getElementById('msg-err');
-  const box    = document.getElementById('result-box');
-  const list   = document.getElementById('result-list');
+  const qty      = parseInt(document.getElementById('qty').value);
+  const manualId = document.getElementById('manual-id').value.trim();
+  const btn      = document.getElementById('gen-btn');
+  const msgOk    = document.getElementById('msg-ok');
+  const msgErr   = document.getElementById('msg-err');
+  const box      = document.getElementById('result-box');
+  const list     = document.getElementById('result-list');
 
   msgOk.style.display  = 'none';
   msgErr.style.display = 'none';
   box.style.display    = 'none';
 
-  if (!qty || qty < 1 || qty > 500) {{
+  if (!manualId && (!qty || qty < 1 || qty > 500)) {{
     msgErr.textContent = 'Please enter a quantity between 1 and 500.';
     msgErr.style.display = 'block';
     return;
@@ -2421,7 +2480,9 @@ async function generateCodes() {{
   btn.textContent = 'Generating...';
 
   try {{
-    const r    = await fetch(`/admin/generate-qr?count=${{qty}}&theme=${{selectedTheme}}&vehicle_type=${{selectedVType}}`);
+    let url = `/admin/generate-qr?count=${{qty}}&theme=${{selectedTheme}}&vehicle_type=${{selectedVType}}`;
+    if (manualId) url += `&manual_id=${{encodeURIComponent(manualId)}}`;
+    const r    = await fetch(url);
     const data = await r.json();
 
     if (!r.ok) {{
@@ -2452,6 +2513,7 @@ async function generateCodes() {{
     `).join('');
 
     box.style.display = 'block';
+    document.getElementById('manual-id').value = '';
     setTimeout(() => location.reload(), 4000);
 
   }} catch(e) {{

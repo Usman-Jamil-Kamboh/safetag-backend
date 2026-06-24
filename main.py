@@ -179,6 +179,10 @@ app.mount("/static", StaticFiles(directory=_STATIC_DIR, check_dir=False), name="
 from app_routes import app_router, run_app_migrations
 app.include_router(app_router)
 
+# -- WebRTC Signalling routes --
+from signalling import signalling_router
+app.include_router(signalling_router)
+
 
 # Permissions-Policy: allow geolocation so browsers don't block it
 from fastapi import Response as _Resp

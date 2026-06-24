@@ -156,6 +156,7 @@ def _bg_init_db(retries: int = 15, delay: float = 3.0):
     for attempt in range(1, retries + 1):
         try:
             init_db()
+            run_app_migrations()
             print("[Pasbaan] Database initialised successfully.", file=sys.stderr)
             return
         except Exception as _e:
@@ -173,6 +174,10 @@ app = FastAPI(title="Pasbaan Pakistan", version="3.0.0", docs_url="/api-docs", l
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 app.mount("/static", StaticFiles(directory=_STATIC_DIR, check_dir=False), name="static")
+
+# -- Owner App routes --
+from app_routes import app_router, run_app_migrations
+app.include_router(app_router)
 
 
 # Permissions-Policy: allow geolocation so browsers don't block it

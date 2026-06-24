@@ -4,3 +4,5 @@ python-multipart==0.0.9
 psycopg2-binary==2.9.9
 qrcode[pil]==7.4.2
 Pillow==10.4.0
+pyjwt
+httpx

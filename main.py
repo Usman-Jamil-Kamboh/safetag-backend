@@ -460,77 +460,115 @@ def db_list_all(page: int = 1, per_page: int = 25):
     return [dict(r) for r in rows], total
 
 
-def db_list_unclaimed(page: int = 1, per_page: int = 25):
+def db_list_unclaimed(page: int = 1, per_page: int = 25, search: str = ""):
     """Return paginated QR codes that have never been claimed (no owner_data)."""
     conn   = get_db()
     cur    = conn.cursor()
     offset = (page - 1) * per_page
+    search_clause = " AND qr_id ILIKE %s" if search else ""
+    params = [f"%{search}%"] if search else []
     cur.execute(
-        "SELECT qr_id, scan_count, activated_at, created_at, theme "
-        "FROM qr_codes WHERE owner_data IS NULL ORDER BY created_at DESC LIMIT %s OFFSET %s",
-        (per_page, offset),
+        f"SELECT qr_id, scan_count, activated_at, created_at, theme "
+        f"FROM qr_codes WHERE owner_data IS NULL{search_clause} ORDER BY created_at DESC LIMIT %s OFFSET %s",
+        (*params, per_page, offset),
     )
     rows = cur.fetchall()
-    cur.execute("SELECT COUNT(*) AS cnt FROM qr_codes WHERE owner_data IS NULL")
+    cur.execute(
+        f"SELECT COUNT(*) AS cnt FROM qr_codes WHERE owner_data IS NULL{search_clause}",
+        params,
+    )
     total = int(cur.fetchone()["cnt"])
     cur.close()
     release_db(conn)
     return [dict(r) for r in rows], total
 
 
-def db_list_by_plan(plan: str, page: int = 1, per_page: int = 25):
-    """Return paginated active QR codes filtered by subscription plan."""
+
+def db_list_by_vehicle_type(vehicle_type: str, page: int = 1, per_page: int = 25,
+                             plan: str = None, search: str = ""):
+    """
+    List stickers of one vehicle type (car / bike / common).
+
+    - plan=None  -> "All" view: every sticker of that type, claimed or not,
+      with whatever plan/status it happens to have (LEFT JOIN).
+    - plan='basic' / 'premium' -> management view: only CLAIMED stickers of
+      that type AND on that plan (INNER JOIN), with full subscription columns
+      (status, expires_at, call_credits) for Activate/Suspend/Add-Pack.
+    - search: optional partial, case-insensitive match on the sticker ID.
+    """
     conn   = get_db()
     cur    = conn.cursor()
     offset = (page - 1) * per_page
+    search_clause = " AND q.qr_id ILIKE %s" if search else ""
+    search_param  = [f"%{search}%"] if search else []
+
+    if plan:
+        cur.execute(
+            f"""SELECT q.qr_id, q.scan_count, q.activated_at, q.created_at, q.theme, q.vehicle_type,
+                       q.owner_data, s.status, s.plan, s.expires_at, s.started_at,
+                       COALESCE(cp.total_remaining, 0) AS call_credits
+                FROM qr_codes q
+                JOIN subscriptions s ON s.qr_id = q.qr_id
+                LEFT JOIN (
+                    SELECT qr_id, SUM(calls_remaining) AS total_remaining
+                    FROM call_packs GROUP BY qr_id
+                ) cp ON cp.qr_id = q.qr_id
+                WHERE q.vehicle_type = %s AND s.plan = %s AND q.owner_data IS NOT NULL{search_clause}
+                ORDER BY q.activated_at DESC NULLS LAST
+                LIMIT %s OFFSET %s""",
+            [vehicle_type, plan, *search_param, per_page, offset],
+        )
+        rows = cur.fetchall()
+        cur.execute(
+            f"""SELECT COUNT(*) AS cnt FROM qr_codes q JOIN subscriptions s ON s.qr_id = q.qr_id
+                WHERE q.vehicle_type = %s AND s.plan = %s AND q.owner_data IS NOT NULL{search_clause}""",
+            [vehicle_type, plan, *search_param],
+        )
+    else:
+        cur.execute(
+            f"""SELECT q.qr_id, q.scan_count, q.activated_at, q.created_at, q.theme, q.vehicle_type,
+                       q.owner_data, s.status, s.plan, s.expires_at
+                FROM qr_codes q
+                LEFT JOIN subscriptions s ON s.qr_id = q.qr_id
+                WHERE q.vehicle_type = %s{search_clause}
+                ORDER BY q.created_at DESC
+                LIMIT %s OFFSET %s""",
+            [vehicle_type, *search_param, per_page, offset],
+        )
+        rows = cur.fetchall()
+        cur.execute(
+            f"SELECT COUNT(*) AS cnt FROM qr_codes q WHERE q.vehicle_type = %s{search_clause}",
+            [vehicle_type, *search_param],
+        )
+
+    total = int(cur.fetchone()["cnt"])
+    cur.close()
+    release_db(conn)
+    return [dict(r) for r in rows], total
+
+
+def db_count_vehicle_plan_breakdown(vehicle_type: str) -> dict:
+    """Basic / Premium / Unclaimed counts within one vehicle type, for the sub-tab badges."""
+    conn = get_db()
+    cur  = conn.cursor()
     cur.execute(
-        """SELECT q.qr_id, q.scan_count, q.activated_at, q.created_at, q.theme,
-                  s.status, s.expires_at, s.started_at,
-                  q.owner_data,
-                  COALESCE(cp.total_remaining, 0) AS call_credits
+        """SELECT
+               COUNT(*) FILTER (WHERE s.plan = 'basic')     AS basic_count,
+               COUNT(*) FILTER (WHERE s.plan = 'premium')   AS premium_count,
+               COUNT(*) FILTER (WHERE q.owner_data IS NULL) AS unclaimed_count
            FROM qr_codes q
-           JOIN subscriptions s ON s.qr_id = q.qr_id
-           LEFT JOIN (
-               SELECT qr_id, SUM(calls_remaining) AS total_remaining
-               FROM call_packs GROUP BY qr_id
-           ) cp ON cp.qr_id = q.qr_id
-           WHERE s.plan = %s AND q.owner_data IS NOT NULL
-           ORDER BY q.activated_at DESC NULLS LAST
-           LIMIT %s OFFSET %s""",
-        (plan, per_page, offset),
+           LEFT JOIN subscriptions s ON s.qr_id = q.qr_id
+           WHERE q.vehicle_type = %s""",
+        (vehicle_type,)
     )
-    rows = cur.fetchall()
-    cur.execute(
-        "SELECT COUNT(*) AS cnt FROM qr_codes q JOIN subscriptions s ON s.qr_id=q.qr_id "
-        "WHERE s.plan=%s AND q.owner_data IS NOT NULL",
-        (plan,),
-    )
-    total = int(cur.fetchone()["cnt"])
+    row = cur.fetchone()
     cur.close()
     release_db(conn)
-    return [dict(r) for r in rows], total
-
-
-def db_list_by_vehicle_type(vehicle_type: str, page: int = 1, per_page: int = 25):
-    """
-    Return paginated QR codes filtered by vehicle type (car / bike / common).
-    Unlike db_list_by_plan, this lists EVERY sticker of that type regardless of
-    activation status — vehicle type is set at print time, not at owner setup.
-    """
-    conn   = get_db()
-    cur    = conn.cursor()
-    offset = (page - 1) * per_page
-    cur.execute(
-        "SELECT qr_id, scan_count, activated_at, created_at, theme, vehicle_type, owner_data "
-        "FROM qr_codes WHERE vehicle_type = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-        (vehicle_type, per_page, offset),
-    )
-    rows = cur.fetchall()
-    cur.execute("SELECT COUNT(*) AS cnt FROM qr_codes WHERE vehicle_type = %s", (vehicle_type,))
-    total = int(cur.fetchone()["cnt"])
-    cur.close()
-    release_db(conn)
-    return [dict(r) for r in rows], total
+    return {
+        "basic":     int(row["basic_count"]     or 0),
+        "premium":   int(row["premium_count"]   or 0),
+        "unclaimed": int(row["unclaimed_count"] or 0),
+    }
 
 
 def db_delete_qr(qr_id: str):
@@ -1130,6 +1168,7 @@ def admin_home(
     request: Request,
     page: int = 1,
     per_page: int = 25,
+    search: str = "",
     session: str = Cookie(default=None),
     key: str = "",
 ):
@@ -1142,57 +1181,12 @@ def admin_home(
     page = max(1, page)
     try:
         stats           = db_stats()
-        rows, total     = db_list_unclaimed(page, per_page)
+        rows, total     = db_list_unclaimed(page, per_page, search=search)
         return HTMLResponse(admin_dashboard_page(
             stats, rows, total, page, per_page,
             key if key == ADMIN_KEY else "",
+            search=search,
         ))
-    except Exception as e:
-        import traceback
-        err = traceback.format_exc()
-        return HTMLResponse(f"<pre style='background:#1a1a1a;color:#f87171;padding:2rem;font-size:13px'>{err}</pre>", status_code=500)
-
-
-@app.get("/admin/basic", response_class=HTMLResponse)
-def admin_basic(
-    page: int = 1,
-    per_page: int = 25,
-    session: str = Cookie(default=None),
-    key: str = "",
-):
-    """Admin page for Basic plan stickers."""
-    authed = is_valid_session(session) or key == ADMIN_KEY
-    if not authed:
-        return HTMLResponse(admin_login_page())
-    if per_page not in (25, 50, 100):
-        per_page = 25
-    page = max(1, page)
-    try:
-        rows, total = db_list_by_plan("basic", page, per_page)
-        return HTMLResponse(admin_plan_page("basic", rows, total, page, per_page))
-    except Exception as e:
-        import traceback
-        err = traceback.format_exc()
-        return HTMLResponse(f"<pre style='background:#1a1a1a;color:#f87171;padding:2rem;font-size:13px'>{err}</pre>", status_code=500)
-
-
-@app.get("/admin/premium", response_class=HTMLResponse)
-def admin_premium(
-    page: int = 1,
-    per_page: int = 25,
-    session: str = Cookie(default=None),
-    key: str = "",
-):
-    """Admin page for Premium plan stickers."""
-    authed = is_valid_session(session) or key == ADMIN_KEY
-    if not authed:
-        return HTMLResponse(admin_login_page())
-    if per_page not in (25, 50, 100):
-        per_page = 25
-    page = max(1, page)
-    try:
-        rows, total = db_list_by_plan("premium", page, per_page)
-        return HTMLResponse(admin_plan_page("premium", rows, total, page, per_page))
     except Exception as e:
         import traceback
         err = traceback.format_exc()
@@ -1203,19 +1197,23 @@ def admin_premium(
 def admin_cars(
     page: int = 1,
     per_page: int = 25,
+    plan: str = "",
+    search: str = "",
     session: str = Cookie(default=None),
     key: str = "",
 ):
-    """Admin page for stickers printed for cars."""
+    """Admin page for stickers printed for cars. plan='' shows all; 'basic'/'premium' filters + manages subscriptions."""
     authed = is_valid_session(session) or key == ADMIN_KEY
     if not authed:
         return HTMLResponse(admin_login_page())
     if per_page not in (25, 50, 100):
         per_page = 25
     page = max(1, page)
+    plan = plan if plan in ("basic", "premium") else None
     try:
-        rows, total = db_list_by_vehicle_type("car", page, per_page)
-        return HTMLResponse(admin_vehicle_page("car", rows, total, page, per_page))
+        rows, total = db_list_by_vehicle_type("car", page, per_page, plan=plan, search=search)
+        breakdown   = db_count_vehicle_plan_breakdown("car")
+        return HTMLResponse(admin_vehicle_page("car", rows, total, page, per_page, plan=plan, search=search, breakdown=breakdown))
     except Exception as e:
         import traceback
         err = traceback.format_exc()
@@ -1226,19 +1224,23 @@ def admin_cars(
 def admin_bikes(
     page: int = 1,
     per_page: int = 25,
+    plan: str = "",
+    search: str = "",
     session: str = Cookie(default=None),
     key: str = "",
 ):
-    """Admin page for stickers printed for bikes."""
+    """Admin page for stickers printed for bikes. plan='' shows all; 'basic'/'premium' filters + manages subscriptions."""
     authed = is_valid_session(session) or key == ADMIN_KEY
     if not authed:
         return HTMLResponse(admin_login_page())
     if per_page not in (25, 50, 100):
         per_page = 25
     page = max(1, page)
+    plan = plan if plan in ("basic", "premium") else None
     try:
-        rows, total = db_list_by_vehicle_type("bike", page, per_page)
-        return HTMLResponse(admin_vehicle_page("bike", rows, total, page, per_page))
+        rows, total = db_list_by_vehicle_type("bike", page, per_page, plan=plan, search=search)
+        breakdown   = db_count_vehicle_plan_breakdown("bike")
+        return HTMLResponse(admin_vehicle_page("bike", rows, total, page, per_page, plan=plan, search=search, breakdown=breakdown))
     except Exception as e:
         import traceback
         err = traceback.format_exc()
@@ -1249,19 +1251,23 @@ def admin_bikes(
 def admin_common(
     page: int = 1,
     per_page: int = 25,
+    plan: str = "",
+    search: str = "",
     session: str = Cookie(default=None),
     key: str = "",
 ):
-    """Admin page for un-categorised stickers (includes the ~80 already printed before this feature)."""
+    """Admin page for un-categorised stickers. plan='' shows all; 'basic'/'premium' filters + manages subscriptions."""
     authed = is_valid_session(session) or key == ADMIN_KEY
     if not authed:
         return HTMLResponse(admin_login_page())
     if per_page not in (25, 50, 100):
         per_page = 25
     page = max(1, page)
+    plan = plan if plan in ("basic", "premium") else None
     try:
-        rows, total = db_list_by_vehicle_type("common", page, per_page)
-        return HTMLResponse(admin_vehicle_page("common", rows, total, page, per_page))
+        rows, total = db_list_by_vehicle_type("common", page, per_page, plan=plan, search=search)
+        breakdown   = db_count_vehicle_plan_breakdown("common")
+        return HTMLResponse(admin_vehicle_page("common", rows, total, page, per_page, plan=plan, search=search, breakdown=breakdown))
     except Exception as e:
         import traceback
         err = traceback.format_exc()
@@ -1515,8 +1521,18 @@ def admin_download_zip(
 # ─────────────────────────────────────────────────────────────────────────────
 # ADMIN — SUBSCRIPTION & CALL PACK MANAGEMENT
 # (Activate / Suspend / Add Pack are now embedded directly inside the
-#  /admin/basic and /admin/premium tables — see admin_plan_page)
+#  Basic/Premium sub-tabs nested under /admin/cars, /admin/bikes, /admin/common
+#  — see admin_vehicle_page)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _vehicle_plan_redirect(qr_id: str, plan: str) -> str:
+    """After an activate/suspend/add-pack action, send the admin back to the
+    Car/Bike/Common page they came from, with the right plan sub-tab open."""
+    rec   = db_get_record(qr_id)
+    vtype = rec.get("vehicle_type", "common") if rec else "common"
+    path  = {"car": "/admin/cars", "bike": "/admin/bikes"}.get(vtype, "/admin/common")
+    return f"{path}?plan={plan}"
+
 
 @app.post("/admin/subscriptions/{qr_id}/activate")
 async def admin_activate_subscription(qr_id: str, session: str = Cookie(default=None)):
@@ -1525,7 +1541,7 @@ async def admin_activate_subscription(qr_id: str, session: str = Cookie(default=
     db_activate_subscription(qr_id)
     sub  = db_get_subscription(qr_id)
     plan = sub.get("plan", "basic") if sub else "basic"
-    return RedirectResponse(url=f"/admin/{plan}", status_code=303)
+    return RedirectResponse(url=_vehicle_plan_redirect(qr_id, plan), status_code=303)
 
 
 @app.post("/admin/subscriptions/{qr_id}/suspend")
@@ -1535,7 +1551,7 @@ async def admin_suspend_subscription(qr_id: str, session: str = Cookie(default=N
     db_deactivate_subscription(qr_id)
     sub  = db_get_subscription(qr_id)
     plan = sub.get("plan", "basic") if sub else "basic"
-    return RedirectResponse(url=f"/admin/{plan}", status_code=303)
+    return RedirectResponse(url=_vehicle_plan_redirect(qr_id, plan), status_code=303)
 
 
 @app.post("/admin/subscriptions/{qr_id}/add-pack")
@@ -1553,7 +1569,7 @@ async def admin_add_call_pack(
     # Build a clean label if not provided
     label = pack_label.strip() or f"{calls}-call pack"
     db_add_call_pack(qr_id, label, calls)
-    return RedirectResponse(url="/admin/premium", status_code=303)
+    return RedirectResponse(url=_vehicle_plan_redirect(qr_id, "premium"), status_code=303)
 
 
 @app.get("/", include_in_schema=False)
@@ -2127,7 +2143,7 @@ input[type=password]:focus{{border-color:#555}}
 </body></html>"""
 
 
-def admin_dashboard_page(stats, rows, total, page, per_page, key="") -> str:
+def admin_dashboard_page(stats, rows, total, page, per_page, key="", search="") -> str:
     def _theme_card(k, v):
         preview = v["preview"]
         label = v["label"]
@@ -2301,21 +2317,11 @@ tr:hover td{{background:#1a1a1a}}
   </div>
 </div>
 
-<!-- Plan nav tabs -->
+<!-- Vehicle-type nav tabs (Basic/Premium are now sub-tabs inside Car / Bike / Common) -->
 <div style="background:#111;border-bottom:1px solid #1e1e1e;padding:0 28px;display:flex;gap:4px;flex-wrap:wrap">
   <a href="/admin" style="display:inline-block;padding:12px 18px;font-size:13px;font-weight:600;
      color:#fff;border-bottom:2px solid #fff;text-decoration:none">
     📦 Unclaimed
-  </a>
-  <a href="/admin/basic" style="display:inline-block;padding:12px 18px;font-size:13px;font-weight:600;
-     color:#555;border-bottom:2px solid transparent;text-decoration:none;transition:color .15s"
-     onmouseover="this.style.color='#aaa'" onmouseout="this.style.color='#555'">
-    🔵 Basic Plan
-  </a>
-  <a href="/admin/premium" style="display:inline-block;padding:12px 18px;font-size:13px;font-weight:600;
-     color:#555;border-bottom:2px solid transparent;text-decoration:none;transition:color .15s"
-     onmouseover="this.style.color='#aaa'" onmouseout="this.style.color='#555'">
-    👑 Premium Plan
   </a>
   <a href="/admin/cars" style="display:inline-block;padding:12px 18px;font-size:13px;font-weight:600;
      color:#555;border-bottom:2px solid transparent;text-decoration:none;transition:color .15s"
@@ -2407,6 +2413,7 @@ tr:hover td{{background:#1a1a1a}}
   <!-- QR Table -->
   <div class="card">
     <div class="card-title">Unclaimed QR Codes ({total} total)</div>
+    {_search_bar_html(search, per_page)}
     <table>
       <thead>
         <tr>
@@ -2599,12 +2606,40 @@ function resetCode(qr_id) {{
 </body></html>"""
 
 
-def admin_plan_page(plan: str, rows: list, total: int, page: int, per_page: int) -> str:
-    """Separate admin page for Basic or Premium plan stickers."""
-    is_premium  = (plan == "premium")
-    plan_label  = "👑 Premium Plan" if is_premium else "🔵 Basic Plan"
-    accent      = "#7c3aed" if is_premium else "#22c55e"
-    accent_dim  = "#3b1f6e" if is_premium else "#052e16"
+def admin_vehicle_page(vehicle_type: str, rows: list, total: int, page: int, per_page: int,
+                        plan: str = None, search: str = "", breakdown: dict = None) -> str:
+    """
+    Admin page for one vehicle type (Car / Bike / Common).
+
+    plan=None             -> "All" view: every sticker of this type (claimed or
+                              not), with a Plan badge column for a quick split.
+    plan='basic'/'premium' -> nested sub-view: only stickers of this type on
+                              that plan, with full subscription management
+                              (Activate / Suspend / Add Call Pack) — this is
+                              where the old standalone /admin/basic and
+                              /admin/premium pages now live, scoped per vehicle type.
+    """
+    meta = {
+        "car":    ("🚗 Car Stickers",    "#3b82f6", "#152238"),
+        "bike":   ("🏍️ Bike Stickers",   "#f97316", "#3a2106"),
+        "common": ("⚪ Common Stickers", "#9ca3af", "#26262a"),
+    }
+    vt_label, vt_accent, vt_accent_dim = meta.get(vehicle_type, meta["common"])
+    breakdown   = breakdown or {"basic": 0, "premium": 0, "unclaimed": 0}
+    grand_total = breakdown["basic"] + breakdown["premium"] + breakdown["unclaimed"]
+
+    is_plan_view = plan in ("basic", "premium")
+    is_premium   = (plan == "premium")
+
+    if is_plan_view:
+        accent     = "#7c3aed" if is_premium else "#22c55e"
+        accent_dim = "#3b1f6e" if is_premium else "#052e16"
+        plan_word  = "👑 Premium" if is_premium else "🔵 Basic"
+        page_title = f"{vt_label} — {plan_word}"
+    else:
+        accent     = vt_accent
+        accent_dim = vt_accent_dim
+        page_title = vt_label
 
     total_pages = (total + per_page - 1) // per_page
 
@@ -2621,9 +2656,8 @@ def admin_plan_page(plan: str, rows: list, total: int, page: int, per_page: int)
 
     rows_html = ""
     for r in rows:
-        qr_id  = r["qr_id"]
-        status = r.get("status", "pending")
-        scans  = r.get("scan_count", 0)
+        qr_id = r["qr_id"]
+        scans = r.get("scan_count", 0)
         try:
             od = r.get("owner_data")
             if isinstance(od, str):
@@ -2633,103 +2667,142 @@ def admin_plan_page(plan: str, rows: list, total: int, page: int, per_page: int)
         except Exception:
             owner_name = vehicle_no = "—"
 
-        if status == "active":
-            status_badge = f'<span style="background:{accent_dim};color:{accent};padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600">Active</span>'
-        elif status == "suspended":
-            status_badge = '<span style="background:#2d0a0a;color:#ef4444;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600">Suspended</span>'
+        if is_plan_view:
+            # Full subscription management row — mirrors the old admin_plan_page,
+            # now also scoped to this vehicle type.
+            status = r.get("status", "pending")
+            if status == "active":
+                status_badge = f'<span style="background:{accent_dim};color:{accent};padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600">Active</span>'
+            elif status == "suspended":
+                status_badge = '<span style="background:#2d0a0a;color:#ef4444;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600">Suspended</span>'
+            else:
+                status_badge = '<span style="background:#1c1200;color:#eab308;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600">Pending</span>'
+
+            expires = "—"
+            if r.get("expires_at"):
+                try:
+                    expires = str(r["expires_at"])[:10]
+                except Exception:
+                    pass
+
+            credits_cell = ""
+            if is_premium:
+                credits       = int(r.get("call_credits", 0))
+                credits_color = "#ef4444" if credits == 0 else ("#eab308" if credits < 10 else accent)
+                credits_cell  = f'<td style="color:{credits_color};font-weight:600">{credits}</td>'
+
+            activate_btn = (
+                f'<form method="POST" action="/admin/subscriptions/{qr_id}/activate" style="display:inline">'
+                f'<button type="submit" class="tbl-btn tbl-btn-green">✅ Activate</button></form>'
+                if status != "active" else ""
+            )
+            suspend_btn = (
+                f'<form method="POST" action="/admin/subscriptions/{qr_id}/suspend" style="display:inline">'
+                f'<button type="submit" class="tbl-btn tbl-btn-danger">🚫 Suspend</button></form>'
+                if status == "active" else ""
+            )
+
+            pack_form = ""
+            if is_premium:
+                pack_form = f"""
+                <details style="margin-top:6px">
+                  <summary style="font-size:11px;font-weight:700;color:#a78bfa;cursor:pointer;padding:4px 0;list-style:none">
+                    ➕ Add Call Pack
+                  </summary>
+                  <form method="POST" action="/admin/subscriptions/{qr_id}/add-pack"
+                        style="margin-top:8px;background:#1a1325;border:1.5px solid #3b1f6e;border-radius:10px;padding:12px;min-width:230px">
+                    <div style="font-size:11px;font-weight:700;color:#a78bfa;margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em">
+                      Add Calls for {qr_id}
+                    </div>
+                    <div style="margin-bottom:8px">
+                      <select name="_preset" id="preset_{qr_id}" onchange="applyPreset(this, '{qr_id}')"
+                              style="width:100%;padding:8px 10px;border-radius:8px;border:1.5px solid #3b1f6e;
+                                     font-size:12px;background:#111;color:#eee;font-family:inherit">
+                        <option value="">— Choose a pack —</option>
+                        {pack_options_html}
+                      </select>
+                    </div>
+                    <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:10px">
+                      <div style="flex:1">
+                        <input type="text" name="pack_label" id="label_{qr_id}" placeholder="Pack label"
+                               style="width:100%;padding:8px 10px;border-radius:8px;border:1.5px solid #3b1f6e;
+                                      font-size:12px;background:#111;color:#eee;font-family:inherit">
+                      </div>
+                      <div style="width:80px">
+                        <input type="number" name="calls" id="calls_{qr_id}" min="1" max="10000" placeholder="20"
+                               style="width:100%;padding:8px 10px;border-radius:8px;border:1.5px solid #3b1f6e;
+                                      font-size:13px;font-weight:700;background:#111;color:#eee;font-family:inherit;text-align:center">
+                      </div>
+                    </div>
+                    <button type="submit"
+                            style="width:100%;padding:9px;background:linear-gradient(135deg,#7c3aed,#6d28d9);
+                                   color:#fff;border:none;border-radius:9px;font-size:12px;font-weight:700;
+                                   cursor:pointer;font-family:inherit">
+                      ✅ Confirm &amp; Add Pack
+                    </button>
+                    <p style="font-size:10px;color:#7c7c8a;margin-top:6px;line-height:1.5">
+                      Only add after confirming payment on JazzCash / Easypaisa.
+                    </p>
+                  </form>
+                </details>"""
+
+            rows_html += f"""
+            <tr id="row-{qr_id}">
+              <td class="mono">{qr_id}</td>
+              <td>{owner_name}</td>
+              <td>{vehicle_no}</td>
+              <td>{status_badge}</td>
+              <td>{scans}</td>
+              {credits_cell}
+              <td>{expires}</td>
+              <td>
+                <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:2px">
+                  <a href="/scan/{qr_id}" class="tbl-btn" target="_blank">👁 View</a>
+                  {activate_btn}
+                  {suspend_btn}
+                  <button class="tbl-btn tbl-btn-warn" onclick="resetCode('{qr_id}')">↺ Reset</button>
+                  <button class="tbl-btn tbl-btn-danger" onclick="deleteCode('{qr_id}')">🗑 Delete</button>
+                </div>
+                {pack_form}
+              </td>
+            </tr>"""
         else:
-            status_badge = '<span style="background:#1c1200;color:#eab308;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600">Pending</span>'
+            # "All" view — quick overview with a Plan badge so the Basic/Premium
+            # split is visible at a glance even before drilling into a sub-tab.
+            active = r.get("activated_at") is not None
+            r_plan = r.get("plan")
+            if r_plan == "premium":
+                plan_badge = '<span style="background:#3b1f6e;color:#a78bfa;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600">👑 Premium</span>'
+            elif r_plan == "basic":
+                plan_badge = '<span style="background:#052e16;color:#4ade80;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600">🔵 Basic</span>'
+            else:
+                plan_badge = '<span style="color:#555;font-size:11px">—</span>'
 
-        expires = "—"
-        if r.get("expires_at"):
-            try:
-                expires = str(r["expires_at"])[:10]
-            except Exception:
-                pass
+            status_badge = (
+                f'<span style="background:{vt_accent_dim};color:{vt_accent};padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600">Active</span>'
+                if active else
+                '<span style="background:#1c1200;color:#eab308;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600">Unclaimed</span>'
+            )
+            reset_btn = (
+                f"<button class='tbl-btn tbl-btn-warn' onclick=\"resetCode('{qr_id}')\">↺ Reset</button>"
+                if active else ""
+            )
 
-        credits_cell = ""
-        if is_premium:
-            credits       = int(r.get("call_credits", 0))
-            credits_color = "#ef4444" if credits == 0 else ("#eab308" if credits < 10 else accent)
-            credits_cell  = f'<td style="color:{credits_color};font-weight:600">{credits}</td>'
-
-        # Manual Activate / Suspend — admin controls the subscription directly here now.
-        activate_btn = (
-            f'<form method="POST" action="/admin/subscriptions/{qr_id}/activate" style="display:inline">'
-            f'<button type="submit" class="tbl-btn tbl-btn-green">✅ Activate</button></form>'
-            if status != "active" else ""
-        )
-        suspend_btn = (
-            f'<form method="POST" action="/admin/subscriptions/{qr_id}/suspend" style="display:inline">'
-            f'<button type="submit" class="tbl-btn tbl-btn-danger">🚫 Suspend</button></form>'
-            if status == "active" else ""
-        )
-
-        # Premium only — add a call pack after confirming JazzCash/Easypaisa payment.
-        pack_form = ""
-        if is_premium:
-            pack_form = f"""
-            <details style="margin-top:6px">
-              <summary style="font-size:11px;font-weight:700;color:#a78bfa;cursor:pointer;padding:4px 0;list-style:none">
-                ➕ Add Call Pack
-              </summary>
-              <form method="POST" action="/admin/subscriptions/{qr_id}/add-pack"
-                    style="margin-top:8px;background:#1a1325;border:1.5px solid #3b1f6e;border-radius:10px;padding:12px;min-width:230px">
-                <div style="font-size:11px;font-weight:700;color:#a78bfa;margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em">
-                  Add Calls for {qr_id}
-                </div>
-                <div style="margin-bottom:8px">
-                  <select name="_preset" id="preset_{qr_id}" onchange="applyPreset(this, '{qr_id}')"
-                          style="width:100%;padding:8px 10px;border-radius:8px;border:1.5px solid #3b1f6e;
-                                 font-size:12px;background:#111;color:#eee;font-family:inherit">
-                    <option value="">— Choose a pack —</option>
-                    {pack_options_html}
-                  </select>
-                </div>
-                <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:10px">
-                  <div style="flex:1">
-                    <input type="text" name="pack_label" id="label_{qr_id}" placeholder="Pack label"
-                           style="width:100%;padding:8px 10px;border-radius:8px;border:1.5px solid #3b1f6e;
-                                  font-size:12px;background:#111;color:#eee;font-family:inherit">
-                  </div>
-                  <div style="width:80px">
-                    <input type="number" name="calls" id="calls_{qr_id}" min="1" max="10000" placeholder="20"
-                           style="width:100%;padding:8px 10px;border-radius:8px;border:1.5px solid #3b1f6e;
-                                  font-size:13px;font-weight:700;background:#111;color:#eee;font-family:inherit;text-align:center">
-                  </div>
-                </div>
-                <button type="submit"
-                        style="width:100%;padding:9px;background:linear-gradient(135deg,#7c3aed,#6d28d9);
-                               color:#fff;border:none;border-radius:9px;font-size:12px;font-weight:700;
-                               cursor:pointer;font-family:inherit">
-                  ✅ Confirm &amp; Add Pack
-                </button>
-                <p style="font-size:10px;color:#7c7c8a;margin-top:6px;line-height:1.5">
-                  Only add after confirming payment on JazzCash / Easypaisa.
-                </p>
-              </form>
-            </details>"""
-
-        rows_html += f"""
-        <tr id="row-{qr_id}">
-          <td class="mono">{qr_id}</td>
-          <td>{owner_name}</td>
-          <td>{vehicle_no}</td>
-          <td>{status_badge}</td>
-          <td>{scans}</td>
-          {credits_cell}
-          <td>{expires}</td>
-          <td>
-            <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:2px">
-              <a href="/scan/{qr_id}" class="tbl-btn" target="_blank">👁 View</a>
-              {activate_btn}
-              {suspend_btn}
-              <button class="tbl-btn tbl-btn-warn" onclick="resetCode('{qr_id}')">↺ Reset</button>
-              <button class="tbl-btn tbl-btn-danger" onclick="deleteCode('{qr_id}')">🗑 Delete</button>
-            </div>
-            {pack_form}
-          </td>
-        </tr>"""
+            rows_html += f"""
+            <tr id="row-{qr_id}">
+              <td class="mono">{qr_id}</td>
+              <td>{owner_name}</td>
+              <td>{vehicle_no}</td>
+              <td>{plan_badge}</td>
+              <td>{status_badge}</td>
+              <td>{scans}</td>
+              <td>
+                <a href="/admin/sticker/{qr_id}" class="tbl-btn" download>⬇ PNG</a>
+                <a href="/scan/{qr_id}" class="tbl-btn" target="_blank">👁 View</a>
+                {reset_btn}
+                <button class="tbl-btn tbl-btn-danger" onclick="deleteCode('{qr_id}')">🗑 Delete</button>
+              </td>
+            </tr>"""
 
     def pg_btn(p, label, disabled=False):
         if disabled:
@@ -2750,22 +2823,59 @@ def admin_plan_page(plan: str, rows: list, total: int, page: int, per_page: int)
           </select>
         </div>"""
 
-    credits_th      = "<th>Credits</th>" if is_premium else ""
-    basic_active    = "" if is_premium else "color:#fff;border-bottom:2px solid #22c55e"
-    basic_inactive  = "color:#555;border-bottom:2px solid transparent"
-    prem_active     = "color:#fff;border-bottom:2px solid #7c3aed" if is_premium else "color:#555;border-bottom:2px solid transparent"
-    empty_msg       = f'<p style="color:#555;font-size:14px;text-align:center;padding:30px 0">No {plan} plan stickers yet.</p>'
+    if is_plan_view:
+        no_results = f'No {vehicle_type} stickers on the {plan_word} plan' + (f' matching "{_esc(search)}".' if search else " yet.")
+    else:
+        no_results = f'No {vehicle_type} stickers' + (f' match "{_esc(search)}".' if search else " yet.")
+    empty_msg = f'<p style="color:#555;font-size:14px;text-align:center;padding:30px 0">{no_results}</p>'
+
+    if is_plan_view:
+        head_cols = (
+            "<th>QR ID</th><th>Owner</th><th>Vehicle</th><th>Status</th><th>Scans</th>"
+            + ("<th>Credits</th>" if is_premium else "")
+            + "<th>Expires</th><th>Actions</th>"
+        )
+    else:
+        head_cols = "<th>QR ID</th><th>Owner</th><th>Vehicle</th><th>Plan</th><th>Status</th><th>Scans</th><th>Actions</th>"
 
     table_html = f"""<div style="overflow-x:auto"><table>
-      <thead><tr>
-        <th>QR ID</th><th>Owner</th><th>Vehicle</th><th>Status</th><th>Scans</th>{credits_th}<th>Expires</th><th>Actions</th>
-      </tr></thead>
+      <thead><tr>{head_cols}</tr></thead>
       <tbody id="qr-tbody">{rows_html}</tbody>
     </table>{pagination_html}</div>""" if rows else empty_msg
 
+    # ── Top nav: Unclaimed / Car / Bike / Common only — Basic & Premium now live INSIDE each ──
+    def navtab(href, label, current):
+        style = f"color:#fff;border-bottom:2px solid {vt_accent}" if current else "color:#555;border-bottom:2px solid transparent"
+        return f'<a href="{href}" style="display:inline-block;padding:12px 18px;font-size:13px;font-weight:600;{style};text-decoration:none">{label}</a>'
+
+    nav_html = (
+        navtab("/admin", "📦 Unclaimed", False) +
+        navtab("/admin/cars", "🚗 Car", vehicle_type == "car") +
+        navtab("/admin/bikes", "🏍️ Bike", vehicle_type == "bike") +
+        navtab("/admin/common", "⚪ Common", vehicle_type == "common")
+    )
+
+    # ── Sub-nav nested under this vehicle type: All / Basic / Premium ──
+    base_path = {"car": "/admin/cars", "bike": "/admin/bikes", "common": "/admin/common"}.get(vehicle_type, "/admin/common")
+
+    def subtab(href, label, current, sub_accent):
+        style = (f"color:#fff;border-color:{sub_accent};background:{sub_accent}22"
+                 if current else "color:#888;border-color:#2a2a2a")
+        return (f'<a href="{href}" style="display:inline-block;padding:8px 16px;font-size:12px;font-weight:600;'
+                f'border:1.5px solid;border-radius:30px;{style};text-decoration:none">{label}</a>')
+
+    sub_nav_html = (
+        subtab(base_path, f"All ({grand_total})", not is_plan_view, vt_accent) +
+        subtab(f"{base_path}?plan=basic", f"🔵 Basic ({breakdown['basic']})", plan == "basic", "#22c55e") +
+        subtab(f"{base_path}?plan=premium", f"👑 Premium ({breakdown['premium']})", plan == "premium", "#7c3aed")
+    )
+
+    search_extra    = {"plan": plan} if plan else None
+    search_bar_html = _search_bar_html(search, per_page, extra_params=search_extra)
+
     return f"""<!DOCTYPE html><html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pasbaan Admin — {plan_label}</title>
+<title>Pasbaan Admin — {page_title}</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f0f0f;color:#e5e5e5;min-height:100vh}}
@@ -2788,11 +2898,11 @@ tr:hover td{{background:#1a1a1a}}
 .tbl-btn:hover{{color:#fff;border-color:#444}}
 .tbl-btn-warn{{border-color:#422006;color:#f97316}}
 .tbl-btn-warn:hover{{background:#431407;color:#fb923c;border-color:#9a3412}}
-.tbl-btn-danger{{border-color:#3f0a0a;color:#ef4444}}
 .tbl-btn-green{{border-color:#14532d;color:#22c55e}}
 .tbl-btn-green:hover{{background:#052e16;color:#4ade80;border-color:#15803d}}
-details summary::-webkit-details-marker{{display:none}}
+.tbl-btn-danger{{border-color:#3f0a0a;color:#ef4444}}
 .tbl-btn-danger:hover{{background:#2d0a0a;color:#f87171;border-color:#7f1d1d}}
+details summary::-webkit-details-marker{{display:none}}
 .pg-bar{{display:flex;align-items:center;gap:8px;margin-top:14px;flex-wrap:wrap}}
 .pg-btn{{padding:5px 12px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:7px;color:#aaa;font-size:12px;cursor:pointer;transition:background .12s}}
 .pg-btn:hover:not([disabled]){{background:#222;color:#fff;border-color:#444}}
@@ -2813,7 +2923,7 @@ details summary::-webkit-details-marker{{display:none}}
 <div class="topbar">
   <div>
     <div class="logo-name">Pas<span class="logo-dot">baan</span> <span style="color:#555;font-weight:400">Admin</span></div>
-    <div class="logo-sub">{plan_label} Stickers</div>
+    <div class="logo-sub">{page_title}</div>
   </div>
   <div style="display:flex;gap:8px;align-items:center">
     <a href="/admin/logout" class="logout">Logout</a>
@@ -2821,23 +2931,17 @@ details summary::-webkit-details-marker{{display:none}}
 </div>
 
 <div style="background:#111;border-bottom:1px solid #1e1e1e;padding:0 28px;display:flex;gap:4px;flex-wrap:wrap">
-  <a href="/admin" style="display:inline-block;padding:12px 18px;font-size:13px;font-weight:600;
-     color:#555;border-bottom:2px solid transparent;text-decoration:none">📦 Unclaimed</a>
-  <a href="/admin/basic" style="display:inline-block;padding:12px 18px;font-size:13px;font-weight:600;
-     {basic_active if not is_premium else basic_inactive};text-decoration:none">🔵 Basic Plan</a>
-  <a href="/admin/premium" style="display:inline-block;padding:12px 18px;font-size:13px;font-weight:600;
-     {prem_active};text-decoration:none">👑 Premium Plan</a>
-  <a href="/admin/cars" style="display:inline-block;padding:12px 18px;font-size:13px;font-weight:600;
-     color:#555;border-bottom:2px solid transparent;text-decoration:none">🚗 Car</a>
-  <a href="/admin/bikes" style="display:inline-block;padding:12px 18px;font-size:13px;font-weight:600;
-     color:#555;border-bottom:2px solid transparent;text-decoration:none">🏍️ Bike</a>
-  <a href="/admin/common" style="display:inline-block;padding:12px 18px;font-size:13px;font-weight:600;
-     color:#555;border-bottom:2px solid transparent;text-decoration:none">⚪ Common</a>
+  {nav_html}
 </div>
 
 <div class="main">
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px">
+    {sub_nav_html}
+  </div>
+
   <div class="card">
-    <div class="card-title">{plan_label} Stickers ({total} total)</div>
+    <div class="card-title">{page_title} ({total} total)</div>
+    {search_bar_html}
     {table_html}
   </div>
 </div>
@@ -2905,218 +3009,44 @@ function applyPreset(sel, qrId) {{
 </body></html>"""
 
 
+def _esc(s: str) -> str:
+    """Minimal HTML-attribute-safe escaping for reflected search input."""
+    return (str(s).replace("&", "&amp;").replace('"', "&quot;")
+                  .replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def admin_vehicle_page(vehicle_type: str, rows: list, total: int, page: int, per_page: int) -> str:
-    """Admin page showing all stickers tagged as Car, Bike, or Common (un-categorised)."""
-    meta = {
-        "car":    ("🚗 Car Stickers",    "#3b82f6", "#152238"),
-        "bike":   ("🏍️ Bike Stickers",   "#f97316", "#3a2106"),
-        "common": ("⚪ Common Stickers", "#9ca3af", "#26262a"),
-    }
-    vt_label, accent, accent_dim = meta.get(vehicle_type, meta["common"])
-
-    total_pages = (total + per_page - 1) // per_page
-
-    rows_html = ""
-    for r in rows:
-        qr_id  = r["qr_id"]
-        active = r.get("activated_at") is not None
-        scans  = r.get("scan_count", 0)
-        try:
-            od = r.get("owner_data")
-            if isinstance(od, str):
-                od = json.loads(od)
-            owner_name = od.get("owner_name", "—") if od else "—"
-            vehicle_no = od.get("vehicle_number", "—") if od else "—"
-        except Exception:
-            owner_name = vehicle_no = "—"
-
-        status_badge = (
-            f'<span style="background:{accent_dim};color:{accent};padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600">Active</span>'
-            if active else
-            '<span style="background:#1c1200;color:#eab308;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600">Unclaimed</span>'
+def _search_bar_html(search: str, per_page: int, extra_params: dict = None) -> str:
+    """
+    Reusable 'Search by Sticker ID' box for the admin list pages.
+    Submits as a plain GET form to the current path, preserving per_page
+    and any extra_params (e.g. {'plan': 'premium'}) via hidden fields so a
+    search doesn't drop the active filter.
+    """
+    safe_search  = _esc(search)
+    hidden_extra = ""
+    clear_qs     = f"per_page={per_page}"
+    if extra_params:
+        for k, v in extra_params.items():
+            if v:
+                hidden_extra += f'<input type="hidden" name="{k}" value="{_esc(v)}">'
+                clear_qs     += f"&{k}={v}"
+    clear_link = ""
+    if search:
+        clear_link = (
+            f'<a href="?{clear_qs}" style="padding:10px 14px;color:#888;font-size:13px;'
+            f'text-decoration:none;white-space:nowrap">✕ Clear</a>'
         )
-        reset_btn = (
-            f"<button class='tbl-btn tbl-btn-warn' onclick=\"resetCode('{qr_id}')\">↺ Reset</button>"
-            if active else ""
-        )
-
-        rows_html += f"""
-        <tr id="row-{qr_id}">
-          <td class="mono">{qr_id}</td>
-          <td>{owner_name}</td>
-          <td>{vehicle_no}</td>
-          <td>{status_badge}</td>
-          <td>{scans}</td>
-          <td>{r.get('theme','classic')}</td>
-          <td>
-            <a href="/admin/sticker/{qr_id}" class="tbl-btn" download>⬇ PNG</a>
-            <a href="/scan/{qr_id}" class="tbl-btn" target="_blank">👁 View</a>
-            {reset_btn}
-            <button class="tbl-btn tbl-btn-danger" onclick="deleteCode('{qr_id}')">🗑 Delete</button>
-          </td>
-        </tr>"""
-
-    def pg_btn(p, label, disabled=False):
-        if disabled:
-            return f'<button class="pg-btn" disabled>{label}</button>'
-        return f'<button class="pg-btn" onclick="goPage({p})">{label}</button>'
-
-    pagination_html = ""
-    if total_pages > 1:
-        pagination_html = f"""
-        <div class="pg-bar">
-          {pg_btn(1, "«", page == 1)}
-          {pg_btn(page - 1, "‹ Prev", page == 1)}
-          <span class="pg-info">Page {page} of {total_pages} &nbsp;·&nbsp; {total} stickers</span>
-          {pg_btn(page + 1, "Next ›", page == total_pages)}
-          {pg_btn(total_pages, "»", page == total_pages)}
-          <select class="pg-select" onchange="changePerPage(this.value)">
-            {"".join(f'<option value="{n}" {"selected" if n == per_page else ""}>{n} / page</option>' for n in [25, 50, 100])}
-          </select>
-        </div>"""
-
-    empty_msg  = f'<p style="color:#555;font-size:14px;text-align:center;padding:30px 0">No {vehicle_type} stickers yet.</p>'
-    table_html = f"""<div style="overflow-x:auto"><table>
-      <thead><tr>
-        <th>QR ID</th><th>Owner</th><th>Vehicle</th><th>Status</th><th>Scans</th><th>Theme</th><th>Actions</th>
-      </tr></thead>
-      <tbody id="qr-tbody">{rows_html}</tbody>
-    </table>{pagination_html}</div>""" if rows else empty_msg
-
-    def navtab(href, label, current):
-        style = f"color:#fff;border-bottom:2px solid {accent}" if current else "color:#555;border-bottom:2px solid transparent"
-        return f'<a href="{href}" style="display:inline-block;padding:12px 18px;font-size:13px;font-weight:600;{style};text-decoration:none">{label}</a>'
-
-    nav_html = (
-        navtab("/admin", "📦 Unclaimed", False) +
-        navtab("/admin/basic", "🔵 Basic Plan", False) +
-        navtab("/admin/premium", "👑 Premium Plan", False) +
-        navtab("/admin/cars", "🚗 Car", vehicle_type == "car") +
-        navtab("/admin/bikes", "🏍️ Bike", vehicle_type == "bike") +
-        navtab("/admin/common", "⚪ Common", vehicle_type == "common")
-    )
-
-    return f"""<!DOCTYPE html><html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pasbaan Admin — {vt_label}</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f0f0f;color:#e5e5e5;min-height:100vh}}
-.topbar{{display:flex;align-items:center;justify-content:space-between;padding:16px 28px;border-bottom:1px solid #1e1e1e;background:#111}}
-.logo-name{{font-size:20px;font-weight:700;color:#fff}}
-.logo-dot{{color:#ef4444}}
-.logo-sub{{font-size:11px;color:#555;margin-top:1px}}
-.logout{{font-size:13px;color:#666;text-decoration:none;padding:6px 14px;border:1px solid #2a2a2a;border-radius:8px}}
-.logout:hover{{color:#fff;border-color:#444}}
-.main{{max-width:1100px;margin:0 auto;padding:28px 20px}}
-.card{{background:#161616;border:1px solid #222;border-radius:16px;padding:24px;margin-bottom:20px}}
-.card-title{{font-size:13px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:.07em;margin-bottom:18px}}
-.mono{{font-family:monospace;font-size:13px;color:{accent}}}
-table{{width:100%;border-collapse:collapse;font-size:13px}}
-th{{text-align:left;padding:8px 12px;color:#555;font-size:11px;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #1e1e1e}}
-td{{padding:10px 12px;border-bottom:1px solid #161616;color:#ccc;vertical-align:middle}}
-tr:last-child td{{border-bottom:none}}
-tr:hover td{{background:#1a1a1a}}
-.tbl-btn{{padding:4px 10px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:6px;color:#888;font-size:11px;text-decoration:none;margin-right:4px;display:inline-block;cursor:pointer;font-family:inherit}}
-.tbl-btn:hover{{color:#fff;border-color:#444}}
-.tbl-btn-warn{{border-color:#422006;color:#f97316}}
-.tbl-btn-warn:hover{{background:#431407;color:#fb923c;border-color:#9a3412}}
-.tbl-btn-danger{{border-color:#3f0a0a;color:#ef4444}}
-.tbl-btn-danger:hover{{background:#2d0a0a;color:#f87171;border-color:#7f1d1d}}
-.pg-bar{{display:flex;align-items:center;gap:8px;margin-top:14px;flex-wrap:wrap}}
-.pg-btn{{padding:5px 12px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:7px;color:#aaa;font-size:12px;cursor:pointer;transition:background .12s}}
-.pg-btn:hover:not([disabled]){{background:#222;color:#fff;border-color:#444}}
-.pg-btn[disabled]{{opacity:.35;cursor:not-allowed}}
-.pg-info{{font-size:12px;color:#555;padding:0 6px}}
-.pg-select{{padding:5px 10px;background:#111;border:1px solid #2a2a2a;border-radius:7px;color:#aaa;font-size:12px;cursor:pointer}}
-.confirm-overlay{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:999;align-items:center;justify-content:center}}
-.confirm-overlay.open{{display:flex}}
-.confirm-box{{background:#1a1a1a;border:1px solid #333;border-radius:16px;padding:28px 32px;max-width:380px;width:90%;text-align:center}}
-.confirm-title{{font-size:16px;font-weight:700;color:#fff;margin-bottom:10px}}
-.confirm-msg{{font-size:13px;color:#888;line-height:1.6;margin-bottom:22px}}
-.confirm-actions{{display:flex;gap:10px;justify-content:center}}
-.confirm-yes-del{{padding:10px 24px;background:#ef4444;color:#fff;border:none;border-radius:9px;font-size:14px;font-weight:600;cursor:pointer}}
-.confirm-yes-reset{{padding:10px 24px;background:#f97316;color:#fff;border:none;border-radius:9px;font-size:14px;font-weight:600;cursor:pointer}}
-.confirm-no{{padding:10px 24px;background:#222;color:#aaa;border:1px solid #333;border-radius:9px;font-size:14px;cursor:pointer}}
-</style></head>
-<body>
-<div class="topbar">
-  <div>
-    <div class="logo-name">Pas<span class="logo-dot">baan</span> <span style="color:#555;font-weight:400">Admin</span></div>
-    <div class="logo-sub">{vt_label}</div>
-  </div>
-  <div style="display:flex;gap:8px;align-items:center">
-    <a href="/admin/logout" class="logout">Logout</a>
-  </div>
-</div>
-
-<div style="background:#111;border-bottom:1px solid #1e1e1e;padding:0 28px;display:flex;gap:4px;flex-wrap:wrap">
-  {nav_html}
-</div>
-
-<div class="main">
-  <div class="card">
-    <div class="card-title">{vt_label} ({total} total)</div>
-    {table_html}
-  </div>
-</div>
-
-<div class="confirm-overlay" id="confirm-overlay">
-  <div class="confirm-box">
-    <div class="confirm-title" id="confirm-title">Are you sure?</div>
-    <div class="confirm-msg" id="confirm-msg"></div>
-    <div class="confirm-actions">
-      <button class="confirm-no" onclick="closeConfirm()">Cancel</button>
-      <button id="confirm-yes-btn" class="confirm-yes-del" onclick="confirmAction()">Confirm</button>
-    </div>
-  </div>
-</div>
-
-<script>
-let currentPage = {page}, currentPer = {per_page};
-function goPage(p) {{
-  const url = new URL(window.location.href);
-  url.searchParams.set('page', p);
-  url.searchParams.set('per_page', currentPer);
-  window.location.href = url.toString();
-}}
-function changePerPage(val) {{
-  const url = new URL(window.location.href);
-  url.searchParams.set('page', 1);
-  url.searchParams.set('per_page', val);
-  window.location.href = url.toString();
-}}
-let _pendingAction = null;
-function closeConfirm() {{ document.getElementById('confirm-overlay').classList.remove('open'); _pendingAction = null; }}
-async function confirmAction() {{ if (_pendingAction) await _pendingAction(); closeConfirm(); }}
-function deleteCode(qr_id) {{
-  document.getElementById('confirm-title').textContent = 'Delete QR Code?';
-  document.getElementById('confirm-msg').innerHTML = `Permanently delete <code>${{qr_id}}</code>? All owner data will be lost.`;
-  document.getElementById('confirm-yes-btn').className = 'confirm-yes-del';
-  document.getElementById('confirm-yes-btn').textContent = 'Yes, Delete';
-  _pendingAction = async () => {{
-    const r = await fetch(`/admin/qr/${{qr_id}}`, {{ method: 'DELETE' }});
-    if (r.ok) {{ const row = document.getElementById(`row-${{qr_id}}`); if (row) row.remove(); }}
-    else alert('Delete failed.');
-  }};
-  document.getElementById('confirm-overlay').classList.add('open');
-}}
-function resetCode(qr_id) {{
-  document.getElementById('confirm-title').textContent = 'Reset QR Code?';
-  document.getElementById('confirm-msg').innerHTML = `Clear all owner data from <code>${{qr_id}}</code> and return it to unclaimed? The sticker ID is kept.`;
-  document.getElementById('confirm-yes-btn').className = 'confirm-yes-reset';
-  document.getElementById('confirm-yes-btn').textContent = 'Yes, Reset';
-  _pendingAction = async () => {{
-    const r = await fetch(`/admin/qr/${{qr_id}}/reset`, {{ method: 'POST' }});
-    if (r.ok) setTimeout(() => location.reload(), 300);
-    else alert('Reset failed.');
-  }};
-  document.getElementById('confirm-overlay').classList.add('open');
-}}
-</script>
-</body></html>"""
+    return f"""
+    <form method="GET" style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center">
+      <input type="hidden" name="per_page" value="{per_page}">
+      {hidden_extra}
+      <input type="text" name="search" value="{safe_search}" placeholder="🔍 Search by Sticker ID — e.g. ST-483920"
+             style="flex:1;min-width:200px;padding:10px 14px;background:#111;border:1.5px solid #2a2a2a;
+                    border-radius:10px;color:#eee;font-size:13px;font-family:inherit;outline:none">
+      <button type="submit" style="padding:10px 18px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:10px;
+              color:#fff;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit">Search</button>
+      {clear_link}
+    </form>"""
 
 
 def _css() -> str:

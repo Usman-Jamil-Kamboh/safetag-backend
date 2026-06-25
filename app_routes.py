@@ -308,20 +308,17 @@ async def request_otp(body: OtpRequestBody):
         )
 
     # Check phone matches — owner_data is a dict stored as JSONB
-    # Your main.py stores owner phone in owner_data["phone1"] and optionally ["phone2"]
+    # DB stores phone in owner_data["owner_phone"] (primary)
+    # Also check "phone1", "phone2" as fallbacks for older records
     registered_phones = []
-    if owner_data.get("phone1"):
-        try:
-            from main import validate_pk_phone
-            registered_phones.append(validate_pk_phone(owner_data["phone1"]))
-        except Exception:
-            pass
-    if owner_data.get("phone2"):
-        try:
-            from main import validate_pk_phone
-            registered_phones.append(validate_pk_phone(owner_data["phone2"]))
-        except Exception:
-            pass
+    for field in ["owner_phone", "phone1", "phone2"]:
+        val = owner_data.get(field)
+        if val:
+            try:
+                from main import validate_pk_phone
+                registered_phones.append(validate_pk_phone(val))
+            except Exception:
+                registered_phones.append(val.strip())
 
     if phone not in registered_phones:
         # Security: don't reveal whether sticker or phone is wrong

@@ -156,7 +156,6 @@ def _bg_init_db(retries: int = 15, delay: float = 3.0):
     for attempt in range(1, retries + 1):
         try:
             init_db()
-            run_app_migrations()
             print("[Pasbaan] Database initialised successfully.", file=sys.stderr)
             return
         except Exception as _e:
@@ -174,14 +173,6 @@ app = FastAPI(title="Pasbaan Pakistan", version="3.0.0", docs_url="/api-docs", l
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 app.mount("/static", StaticFiles(directory=_STATIC_DIR, check_dir=False), name="static")
-
-# -- Owner App routes --
-from app_routes import app_router, run_app_migrations
-app.include_router(app_router)
-
-# -- WebRTC Signalling routes --
-from signalling import signalling_router
-app.include_router(signalling_router)
 
 
 # Permissions-Policy: allow geolocation so browsers don't block it
@@ -3900,11 +3891,154 @@ def page_contact(qr_id: str, data: dict, scan_count: int, plan: str = "basic", c
                <div class="c-name">{c['name']}</div></div>
           <div class="c-arrow">›</div></a>"""
 
-    # Owner direct call card — uses owner's own phone number
+    # Owner direct call card
     owner_phone = data.get("owner_phone", "") or (data["contacts"][0]["phone"] if data.get("contacts") else "")
     owner_call_card = ""
     if owner_phone and not premium_no_credits:
-        owner_call_card = f"""
+
+        if plan == "premium":
+            # PREMIUM: Online masked call via WebRTC — number stays private
+            owner_call_card = f"""
+<div class="card" style="background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);
+     border:1.5px solid rgba(99,102,241,.4);padding:20px;">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+    <div style="width:36px;height:36px;border-radius:10px;
+         background:linear-gradient(135deg,#6366f1,#4f46e5);
+         display:flex;align-items:center;justify-content:center;font-size:18px;">🔒</div>
+    <div>
+      <div style="font-size:11px;color:#a5b4fc;letter-spacing:1px;text-transform:uppercase;">Premium Member</div>
+      <div style="font-size:15px;font-weight:700;color:#fff;">Masked Online Call</div>
+    </div>
+  </div>
+  <p style="font-size:13px;color:#c7d2fe;margin-bottom:16px;line-height:1.6;">
+    Call the vehicle owner securely. Their number stays private — the call goes through Pasbaan.
+  </p>
+  <div id="owner-status" style="display:flex;align-items:center;gap:8px;
+       margin-bottom:14px;padding:8px 12px;
+       background:rgba(255,255,255,.06);border-radius:10px;">
+    <div id="status-dot" style="width:8px;height:8px;border-radius:50%;
+         background:#6b7280;flex-shrink:0;"></div>
+    <span id="status-text" style="font-size:12px;color:#9ca3af;">Checking availability...</span>
+  </div>
+  <button id="call-btn" onclick="startCall()" disabled
+    style="width:100%;padding:16px;border:none;border-radius:14px;
+           background:linear-gradient(135deg,#6366f1,#4f46e5);
+           color:#fff;font-size:16px;font-weight:700;cursor:not-allowed;
+           opacity:0.5;transition:all .2s;display:flex;align-items:center;
+           justify-content:center;gap:10px;">
+    <span id="call-btn-icon">📞</span>
+    <span id="call-btn-text">Call Owner</span>
+  </button>
+  <div id="call-active" style="display:none;text-align:center;padding:20px 0;">
+    <div style="font-size:48px;margin-bottom:12px;">📞</div>
+    <div style="font-size:18px;font-weight:700;color:#fff;margin-bottom:6px;">Call Connected</div>
+    <div id="call-timer" style="font-size:28px;font-weight:700;color:#6366f1;
+         font-variant-numeric:tabular-nums;margin-bottom:20px;">0:00</div>
+    <button onclick="endCall()"
+      style="padding:16px 40px;border:none;border-radius:14px;
+             background:#ef4444;color:#fff;font-size:16px;
+             font-weight:700;cursor:pointer;">
+      📵 End Call
+    </button>
+  </div>
+  <p style="font-size:11px;color:#6366f1;margin-top:12px;text-align:center;">
+    🔒 End-to-end encrypted · Number never revealed
+  </p>
+</div>
+<script>
+const QR_ID   = "{qr_id}";
+const WS_BASE = "wss://api.pasbaan.com";
+let ws=null,pc=null,localStream=null,callTimer=null,callSeconds=0;
+async function checkOwnerStatus(){{
+  try{{
+    const r=await fetch(`https://api.pasbaan.com/ws/status/${{QR_ID}}`);
+    const d=await r.json();setStatus(d.online);
+  }}catch(e){{setStatus(false);}}
+}}
+function setStatus(online){{
+  const dot=document.getElementById('status-dot');
+  const txt=document.getElementById('status-text');
+  const btn=document.getElementById('call-btn');
+  if(online){{
+    dot.style.background='#22c55e';txt.style.color='#86efac';
+    txt.textContent='Owner is online — ready to receive calls';
+    btn.disabled=false;btn.style.opacity='1';btn.style.cursor='pointer';
+  }}else{{
+    dot.style.background='#6b7280';txt.style.color='#9ca3af';
+    txt.textContent='Owner is currently offline';
+    btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='not-allowed';
+  }}
+}}
+async function startCall(){{
+  const btn=document.getElementById('call-btn');
+  btn.disabled=true;
+  document.getElementById('call-btn-text').textContent='Connecting...';
+  try{{localStream=await navigator.mediaDevices.getUserMedia({{audio:true,video:false}});}}
+  catch(e){{alert('Microphone access is required.');resetCallUI();return;}}
+  ws=new WebSocket(`${{WS_BASE}}/ws/call/${{QR_ID}}/scanner`);
+  ws.onmessage=async(e)=>{{
+    const msg=JSON.parse(e.data);
+    if(msg.type==='status'){{
+      if(!msg.online){{alert('Owner just went offline.');hangup();return;}}
+      await createOffer();
+    }}else if(msg.type==='answer'){{
+      await pc.setRemoteDescription(new RTCSessionDescription({{type:'answer',sdp:msg.sdp}}));
+      showActiveCall();
+    }}else if(msg.type==='ice'){{
+      try{{await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));}}catch(e){{}}
+    }}else if(msg.type==='rejected'){{alert('Owner declined the call.');hangup();}}
+    else if(msg.type==='end'||msg.type==='owner_offline'){{hangup();}}
+  }};
+  ws.onclose=()=>{{if(pc)hangup();}};
+  ws.onerror=()=>{{alert('Connection error.');hangup();}};
+}}
+async function createOffer(){{
+  pc=new RTCPeerConnection({{iceServers:[{{urls:'stun:stun.l.google.com:19302'}}]}});
+  localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
+  pc.onicecandidate=(e)=>{{
+    if(e.candidate&&ws&&ws.readyState===1)
+      ws.send(JSON.stringify({{type:'ice',candidate:e.candidate.toJSON()}}));
+  }};
+  pc.onconnectionstatechange=()=>{{
+    if(pc.connectionState==='failed'||pc.connectionState==='disconnected')hangup();
+  }};
+  const offer=await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  ws.send(JSON.stringify({{type:'offer',sdp:offer.sdp}}));
+}}
+function showActiveCall(){{
+  document.getElementById('call-btn').style.display='none';
+  document.getElementById('call-active').style.display='block';
+  callSeconds=0;
+  callTimer=setInterval(()=>{{
+    callSeconds++;
+    const m=Math.floor(callSeconds/60),s=callSeconds%60;
+    document.getElementById('call-timer').textContent=m+':'+String(s).padStart(2,'0');
+  }},1000);
+}}
+function endCall(){{
+  if(ws&&ws.readyState===1)ws.send(JSON.stringify({{type:'end'}}));hangup();
+}}
+function hangup(){{
+  clearInterval(callTimer);
+  if(localStream){{localStream.getTracks().forEach(t=>t.stop());localStream=null;}}
+  if(pc){{pc.close();pc=null;}}
+  if(ws){{ws.close();ws=null;}}
+  resetCallUI();
+}}
+function resetCallUI(){{
+  document.getElementById('call-btn').style.display='flex';
+  document.getElementById('call-active').style.display='none';
+  document.getElementById('call-btn-text').textContent='Call Owner';
+  checkOwnerStatus();
+}}
+checkOwnerStatus();
+setInterval(checkOwnerStatus,30000);
+</script>"""
+
+        else:
+            # BASIC: Show real phone number (existing behaviour)
+            owner_call_card = f"""
 <div class="card" style="background:linear-gradient(135deg,#1e3a5f 0%,#1d4ed8 100%);border:none;padding:20px;">
   <div class="sec-title" style="color:#bfdbfe;margin-bottom:6px;">📞 Call Vehicle Owner</div>
   <p style="font-size:13px;color:#93c5fd;margin-bottom:14px;line-height:1.6">

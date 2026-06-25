@@ -157,12 +157,19 @@ def _bg_init_db(retries: int = 15, delay: float = 3.0):
         try:
             init_db()
             print("[Pasbaan] Database initialised successfully.", file=sys.stderr)
-            return
+            break
         except Exception as _e:
             print(f"[Pasbaan] init_db attempt {attempt}/{retries} failed: {_e}", file=sys.stderr)
             if attempt < retries:
                 time.sleep(delay)
-    print("[Pasbaan] WARNING: DB init failed after all retries.", file=sys.stderr)
+    else:
+        print("[Pasbaan] WARNING: DB init failed after all retries.", file=sys.stderr)
+        return
+    # Step 3: run Owner App migrations (app_otps table, call_logs columns)
+    try:
+        run_app_migrations()
+    except Exception as _e:
+        print(f"[Pasbaan] WARNING: run_app_migrations failed: {_e}", file=sys.stderr)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -173,6 +180,14 @@ app = FastAPI(title="Pasbaan Pakistan", version="3.0.0", docs_url="/api-docs", l
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 app.mount("/static", StaticFiles(directory=_STATIC_DIR, check_dir=False), name="static")
+
+# ── Owner App (Flutter) + WebRTC masked-calling routers ─────────────────────
+# These were previously defined in app_routes.py / signalling.py but never
+# wired in, so /app/* and /ws/* were all returning 404 on the live server.
+from app_routes import app_router, run_app_migrations  # noqa: E402
+from signalling import signalling_router                # noqa: E402
+app.include_router(app_router)
+app.include_router(signalling_router)
 
 
 # Permissions-Policy: allow geolocation so browsers don't block it
@@ -683,6 +698,64 @@ def db_add_call_pack(qr_id: str, pack_label: str, calls: int):
     conn.commit()
     cur.close()
     release_db(conn)
+
+
+def db_deduct_call_credit(qr_id: str) -> bool:
+    """
+    Deduct 1 call credit from the oldest pack that still has credits left
+    (FIFO). Used when a Premium 'Call via Pasbaan' call actually connects.
+    Returns True if a credit was deducted, False if no credits were available.
+    """
+    conn = get_db()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE call_packs
+               SET calls_remaining = calls_remaining - 1
+             WHERE id = (
+                 SELECT id FROM call_packs
+                  WHERE qr_id = %s AND calls_remaining > 0
+                  ORDER BY purchased_at ASC
+                  LIMIT 1
+             )
+            RETURNING id
+            """,
+            (qr_id,)
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return row is not None
+    except Exception:
+        conn.rollback()
+        return False
+    finally:
+        cur.close()
+        release_db(conn)
+
+
+def db_log_call(qr_id: str, status: str, duration_s: Optional[int] = None,
+                 caller_label: str = "Scanner") -> None:
+    """
+    Insert a row into call_logs for a finished/failed call attempt.
+    status: 'completed' | 'rejected' | 'offline' | 'no_answer'
+    Safe no-op on failure — this is best-effort history, never blocks the call flow.
+    """
+    conn = get_db()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            """INSERT INTO call_logs (qr_id, contact_idx, duration_s, status, caller_label, ended_at)
+               VALUES (%s, 0, %s, %s, %s, NOW())""",
+            (qr_id, duration_s, status, caller_label)
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[Pasbaan] db_log_call failed (non-fatal): {e}", file=sys.stderr)
+    finally:
+        cur.close()
+        release_db(conn)
 
 
 def db_get_call_packs_for_qr(qr_id: str) -> list:

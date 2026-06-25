@@ -41,6 +41,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
+import psycopg2.extras
 import jwt                          # pip install pyjwt
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import JSONResponse
@@ -101,7 +102,7 @@ def _migrate_app_tables():
     """
     get_db, release_db = _get_db_funcs()
     conn = get_db()
-    cur  = conn.cursor()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     # Table to store pending OTPs
     cur.execute("""
@@ -254,7 +255,7 @@ def _get_owner_row(sticker_id: str) -> Optional[dict]:
     """
     get_db, release_db = _get_db_funcs()
     conn = get_db()
-    cur  = conn.cursor()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(
         "SELECT qr_id, owner_data, scan_count FROM qr_codes WHERE qr_id = %s",
         (sticker_id.upper(),)
@@ -336,7 +337,7 @@ async def request_otp(body: OtpRequestBody):
     # Store OTP in DB (invalidate any existing unused OTPs for this sticker first)
     get_db, release_db = _get_db_funcs()
     conn = get_db()
-    cur  = conn.cursor()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         # Mark old OTPs as used so only one is valid at a time
         cur.execute(
@@ -409,7 +410,7 @@ async def verify_otp(body: OtpVerifyBody):
 
     get_db, release_db = _get_db_funcs()
     conn = get_db()
-    cur  = conn.cursor()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     try:
         # Fetch the most recent unused OTP for this sticker+phone combination
@@ -555,7 +556,7 @@ async def get_call_history(
 
     get_db, release_db = _get_db_funcs()
     conn = get_db()
-    cur  = conn.cursor()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     try:
         # Get total count

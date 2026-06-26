@@ -58,10 +58,21 @@ class OwnerWsService {
 
       _channelSub = newChannel.stream.listen(
         (raw) {
-          try { onMessage?.call(jsonDecode(raw as String)); } catch (_) {}
+          print('[OwnerWsService] RAW MESSAGE RECEIVED: $raw');
+          try {
+            onMessage?.call(jsonDecode(raw as String));
+          } catch (e) {
+            print('[OwnerWsService] ERROR handling message: $e');
+          }
         },
-        onDone: () => _onDisconnect(newChannel),
-        onError: (_) => _onDisconnect(newChannel),
+        onDone: () {
+          print('[OwnerWsService] WS onDone (disconnected)');
+          _onDisconnect(newChannel);
+        },
+        onError: (e) {
+          print('[OwnerWsService] WS onError: $e');
+          _onDisconnect(newChannel);
+        },
         cancelOnError: false,
       );
 

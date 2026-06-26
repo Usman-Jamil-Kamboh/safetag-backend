@@ -8,7 +8,7 @@ SCAN LOGIC:    scan_count==0 → plan selection → owner setup | scan_count>=1 
 
 PLANS:
   basic   — Rs. 399/6 months — public phone numbers shown on contact page
-  premium — Rs. 399/6 months + call packs — masked calling via Twilio (coming soon)
+  premium — Rs. 399/6 months + call packs — masked online calling via Pasbaan (active)
 """
 
 import hashlib, hmac, io, json, os, secrets, sys, time, zipfile
@@ -156,8 +156,11 @@ def _bg_init_db(retries: int = 15, delay: float = 3.0):
     for attempt in range(1, retries + 1):
         try:
             init_db()
-            run_app_migrations()
             print("[Pasbaan] Database initialised successfully.", file=sys.stderr)
+            try:
+                run_app_migrations()
+            except Exception as _me:
+                print(f"[Pasbaan] WARNING: run_app_migrations failed: {_me}", file=sys.stderr)
             return
         except Exception as _e:
             print(f"[Pasbaan] init_db attempt {attempt}/{retries} failed: {_e}", file=sys.stderr)
@@ -175,12 +178,13 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 app.mount("/static", StaticFiles(directory=_STATIC_DIR, check_dir=False), name="static")
 
-# ── Owner App routes ──
+# ── Owner App API + WebRTC masked-calling signalling ───────────────────────
+# These were written as drop-in routers but never actually wired up — the
+# /app/* (login/OTP/call-history) and /ws/* (masked calling) endpoints were
+# 404ing on Render until this include_router() call was added.
 from app_routes import app_router, run_app_migrations
-app.include_router(app_router)
-
-# ── WebRTC Signalling routes ──
 from signalling import signalling_router
+app.include_router(app_router)
 app.include_router(signalling_router)
 
 
@@ -3294,13 +3298,7 @@ body{{
   </div>
 
   <!-- ── PREMIUM PLAN ── -->
-  <div class="plan premium" style="opacity:.72;pointer-events:none;user-select:none;position:relative">
-    <div style="position:absolute;top:14px;right:14px;z-index:10;
-                background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff;
-                font-size:11px;font-weight:800;letter-spacing:.07em;
-                padding:4px 12px;border-radius:20px;box-shadow:0 2px 8px rgba(217,119,6,.35)">
-      🚀 COMING SOON
-    </div>
+  <div class="plan premium" style="position:relative">
     <div class="plan-top premium-top">
       <div class="plan-label">
         <span class="plan-pill" style="background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff">👑 PREMIUM</span>
@@ -3365,11 +3363,13 @@ body{{
         Each call = 2 minutes. Buy once, use at your own pace.
       </p>
 
-      <button type="button" class="plan-btn" disabled
-        style="background:#d1d5db;color:#9ca3af;cursor:not-allowed;
-               box-shadow:none;pointer-events:none;">
-        🚀 Coming Soon
-      </button>
+      <form method="POST" action="/scan/{qr_id}/select-plan">
+        <input type="hidden" name="plan" value="premium">
+        <button type="submit" class="plan-btn"
+          style="background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;">
+          👑 Select Premium &rarr;
+        </button>
+      </form>
     </div>
   </div>
 
@@ -3900,124 +3900,11 @@ def page_contact(qr_id: str, data: dict, scan_count: int, plan: str = "basic", c
                <div class="c-name">{c['name']}</div></div>
           <div class="c-arrow">›</div></a>"""
 
-    # Owner direct call card
+    # Owner direct call card — uses owner's own phone number
     owner_phone = data.get("owner_phone", "") or (data["contacts"][0]["phone"] if data.get("contacts") else "")
     owner_call_card = ""
     if owner_phone and not premium_no_credits:
-
-        if plan == "premium":
-            # PREMIUM: Masked online call via WebRTC — number stays private
-            owner_call_card = f"""
-<div class="card" style="background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);
-     border:1.5px solid rgba(99,102,241,.4);padding:20px;">
-  <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
-    <div style="width:36px;height:36px;border-radius:10px;
-         background:linear-gradient(135deg,#6366f1,#4f46e5);
-         display:flex;align-items:center;justify-content:center;font-size:18px;">🔒</div>
-    <div>
-      <div style="font-size:11px;color:#a5b4fc;letter-spacing:1px;text-transform:uppercase;">Premium Member</div>
-      <div style="font-size:15px;font-weight:700;color:#fff;">Call via Pasbaan</div>
-    </div>
-  </div>
-  <p style="font-size:13px;color:#c7d2fe;margin-bottom:16px;line-height:1.6;">
-    Call the owner instantly. Their number stays private — call goes through Pasbaan.
-  </p>
-  <div id="owner-status" style="display:flex;align-items:center;gap:8px;
-       margin-bottom:14px;padding:8px 12px;
-       background:rgba(255,255,255,.06);border-radius:10px;">
-    <div id="status-dot" style="width:8px;height:8px;border-radius:50%;
-         background:#6b7280;flex-shrink:0;transition:background .3s;"></div>
-    <span id="status-text" style="font-size:12px;color:#9ca3af;">Checking availability...</span>
-  </div>
-  <button id="call-btn" onclick="startCall()" disabled
-    style="width:100%;padding:16px;border:none;border-radius:14px;
-           background:linear-gradient(135deg,#6366f1,#4f46e5);
-           color:#fff;font-size:16px;font-weight:700;cursor:not-allowed;
-           opacity:0.5;transition:all .2s;display:flex;align-items:center;
-           justify-content:center;gap:10px;">
-    <span>📞</span>
-    <span id="call-btn-text">Call Owner</span>
-  </button>
-  <div id="call-active" style="display:none;text-align:center;padding:20px 0;">
-    <div style="font-size:48px;margin-bottom:12px;">📞</div>
-    <div style="font-size:18px;font-weight:700;color:#fff;margin-bottom:6px;">Call Connected</div>
-    <div id="call-timer" style="font-size:28px;font-weight:700;color:#6366f1;
-         font-variant-numeric:tabular-nums;margin-bottom:20px;">0:00</div>
-    <button onclick="endCall()"
-      style="padding:16px 40px;border:none;border-radius:14px;
-             background:#ef4444;color:#fff;font-size:16px;font-weight:700;cursor:pointer;">
-      📵 End Call
-    </button>
-  </div>
-  <p style="font-size:11px;color:#a5b4fc;margin-top:12px;text-align:center;">
-    🔒 Number never revealed · Free for you
-  </p>
-</div>
-<script>
-(function(){{
-const QR_ID="{qr_id}",WS_BASE="wss://api.pasbaan.com";
-let ws=null,pc=null,localStream=null,timer=null,secs=0;
-async function checkStatus(){{
-  try{{const r=await fetch("https://api.pasbaan.com/ws/status/"+QR_ID);
-  const d=await r.json();setOnline(d.online);}}catch(e){{setOnline(false);}}
-}}
-function setOnline(on){{
-  document.getElementById("status-dot").style.background=on?"#22c55e":"#6b7280";
-  document.getElementById("status-text").style.color=on?"#86efac":"#9ca3af";
-  document.getElementById("status-text").textContent=on?"Owner is online — tap to call":"Owner is currently offline";
-  const b=document.getElementById("call-btn");
-  b.disabled=!on;b.style.opacity=on?"1":"0.5";b.style.cursor=on?"pointer":"not-allowed";
-}}
-async function startCall(){{
-  document.getElementById("call-btn").disabled=true;
-  document.getElementById("call-btn-text").textContent="Connecting...";
-  try{{localStream=await navigator.mediaDevices.getUserMedia({{audio:true,video:false}});}}
-  catch(e){{alert("Microphone access is required to make a call.");reset();return;}}
-  ws=new WebSocket(WS_BASE+"/ws/call/"+QR_ID+"/scanner");
-  ws.onmessage=async function(e){{
-    const m=JSON.parse(e.data);
-    if(m.type==="status"){{if(!m.online){{alert("Owner just went offline.");hangup();return;}}await offer();}}
-    else if(m.type==="answer"){{await pc.setRemoteDescription(new RTCSessionDescription({{type:"answer",sdp:m.sdp}}));showCall();}}
-    else if(m.type==="ice"){{try{{await pc.addIceCandidate(new RTCIceCandidate(m.candidate));}}catch(e){{}}}}
-    else if(m.type==="rejected"){{alert("Owner declined the call.");hangup();}}
-    else if(m.type==="end"||m.type==="owner_offline"){{hangup();}}
-  }};
-  ws.onclose=function(){{if(pc)hangup();}};
-  ws.onerror=function(){{alert("Connection error. Please try again.");hangup();}};
-}}
-async function offer(){{
-  pc=new RTCPeerConnection({{iceServers:[{{urls:"stun:stun.l.google.com:19302"}}]}});
-  localStream.getTracks().forEach(function(t){{pc.addTrack(t,localStream);}});
-  pc.onicecandidate=function(e){{if(e.candidate&&ws&&ws.readyState===1)ws.send(JSON.stringify({{type:"ice",candidate:e.candidate.toJSON()}}));}};
-  pc.onconnectionstatechange=function(){{if(pc.connectionState==="failed"||pc.connectionState==="disconnected")hangup();}};
-  const o=await pc.createOffer();await pc.setLocalDescription(o);
-  ws.send(JSON.stringify({{type:"offer",sdp:o.sdp}}));
-}}
-function showCall(){{
-  document.getElementById("call-btn").style.display="none";
-  document.getElementById("call-active").style.display="block";
-  secs=0;timer=setInterval(function(){{secs++;var m=Math.floor(secs/60),s=secs%60;
-  document.getElementById("call-timer").textContent=m+":"+String(s).padStart(2,"0");}},1000);
-}}
-function endCall(){{if(ws&&ws.readyState===1)ws.send(JSON.stringify({{type:"end"}}));hangup();}}
-function hangup(){{
-  clearInterval(timer);
-  if(localStream){{localStream.getTracks().forEach(function(t){{t.stop();}});localStream=null;}}
-  if(pc){{pc.close();pc=null;}}if(ws){{ws.close();ws=null;}}reset();
-}}
-function reset(){{
-  document.getElementById("call-btn").style.display="flex";
-  document.getElementById("call-active").style.display="none";
-  document.getElementById("call-btn-text").textContent="Call Owner";
-  checkStatus();
-}}
-checkStatus();setInterval(checkStatus,30000);
-}})();
-</script>"""
-
-        else:
-            # BASIC: Show real phone number
-            owner_call_card = f"""
+        owner_call_card = f"""
 <div class="card" style="background:linear-gradient(135deg,#1e3a5f 0%,#1d4ed8 100%);border:none;padding:20px;">
   <div class="sec-title" style="color:#bfdbfe;margin-bottom:6px;">📞 Call Vehicle Owner</div>
   <p style="font-size:13px;color:#93c5fd;margin-bottom:14px;line-height:1.6">
@@ -4035,6 +3922,27 @@ checkStatus();setInterval(checkStatus,30000);
     </div>
     <div style="font-size:28px;color:#60a5fa;font-weight:300;">›</div>
   </a>
+</div>"""
+
+    # ── Call via Pasbaan (WebRTC masked call) ────────────────────────────────
+    # Free, in-app call straight to the owner's phone via the signalling
+    # server + Flutter owner app — no phone numbers exchanged either side.
+    # Only offered to Premium owners who still have call credits; Basic and
+    # locked-out Premium (0 credits) fall back to the existing tel: buttons.
+    show_masked_call = (plan == "premium" and not premium_no_credits)
+    masked_call_card = ""
+    if show_masked_call:
+        masked_call_card = """<div class="card" id="pc-card" style="background:linear-gradient(135deg,#3b1f6e 0%,#6d28d9 100%);border:none;padding:20px;">
+  <div class="sec-title" style="color:#ddd6fe;margin-bottom:6px;">👑 Call via Pasbaan</div>
+  <p style="font-size:13px;color:#c4b5fd;margin-bottom:14px;line-height:1.6">
+    Free, private call straight to the owner's app — numbers stay hidden on both sides.
+  </p>
+  <button onclick="pcStart()" id="pc-start-btn" style="width:100%;display:flex;align-items:center;justify-content:center;gap:10px;padding:16px 18px;
+     background:rgba(255,255,255,.14);backdrop-filter:blur(8px);
+     border:1.5px solid rgba(255,255,255,.3);border-radius:14px;
+     color:#fff;font-size:15px;font-weight:700;cursor:pointer;font-family:inherit;">
+    📞 Call via Pasbaan
+  </button>
 </div>"""
 
     # Build WhatsApp number list — only contacts marked as WhatsApp
@@ -4178,14 +4086,298 @@ sppin.addEventListener('input',()=>{{if(sppin.value.length===4) document.getElem
 </script>"""
     else:  # basic plan
         plan_switch_html = (
-            '<button disabled'
-            ' style="width:100%;margin-top:6px;padding:11px;background:#f3f4f6;'
-            'border:1.5px solid #e5e7eb;border-radius:13px;font-size:13px;'
-            'color:#9ca3af;cursor:not-allowed;font-family:inherit;pointer-events:none;">'
-            ' \U0001f680 Upgrade to Premium \u2014 Coming Soon</button>'
+            '<button onclick="document.getElementById(\'upgrade-modal\').style.display=\'flex\'"'
+            ' style="width:100%;margin-top:6px;padding:11px;'
+            'background:linear-gradient(135deg,#7c3aed,#6d28d9);'
+            'border:none;border-radius:13px;font-size:13px;'
+            'color:#fff;cursor:pointer;font-family:inherit;font-weight:700;">'
+            ' 👑 Upgrade to Premium</button>'
         )
-        plan_switch_modal_html = ""
+        plan_switch_modal_html = (
+            f'<div id="upgrade-modal" style="display:none;position:fixed;inset:0;'
+            'background:rgba(0,0,0,.6);z-index:999;align-items:center;justify-content:center;">'
+            '<div style="background:#fff;border-radius:20px;padding:28px 24px;max-width:340px;width:90%;margin:auto;">'
+            '<h3 style="font-size:18px;font-weight:700;margin-bottom:8px;">👑 Upgrade to Premium</h3>'
+            '<p style="font-size:13px;color:#6b7280;margin-bottom:16px;line-height:1.6;">'
+            'Enter your 4-digit PIN to confirm the upgrade. Your numbers will become private immediately.</p>'
+            f'<form method="POST" action="/scan/{qr_id}/switch-to-premium">'
+            '<input name="pin" type="password" inputmode="numeric" maxlength="4" placeholder="Enter PIN"'
+            ' style="width:100%;padding:12px;border:1.5px solid #e5e7eb;border-radius:12px;'
+            'font-size:20px;text-align:center;letter-spacing:8px;margin-bottom:14px;box-sizing:border-box;">'
+            '<button type="submit"'
+            ' style="width:100%;padding:13px;background:linear-gradient(135deg,#7c3aed,#6d28d9);'
+            'color:#fff;border:none;border-radius:12px;font-size:15px;font-weight:700;cursor:pointer;">'
+            'Confirm Upgrade &rarr;</button></form>'
+            '<button onclick="document.getElementById(\'upgrade-modal\').style.display=\'none\'"'
+            ' style="width:100%;margin-top:10px;padding:11px;background:#f3f4f6;'
+            'border:none;border-radius:12px;font-size:14px;cursor:pointer;">Cancel</button>'
+            '</div></div>'
+        )
 
+
+    masked_call_modal_script = ""
+    if show_masked_call:
+        masked_call_modal_script = f"""
+<!-- Call-via-Pasbaan modal overlay -->
+<div id="pc-modal" style="display:none;position:fixed;inset:0;background:#0d0f14;z-index:1000;
+     align-items:center;justify-content:center;">
+  <div style="width:100%;max-width:380px;padding:32px 24px;text-align:center;color:#fff;">
+    <div id="pc-icon" style="width:90px;height:90px;border-radius:50%;margin:0 auto 20px;
+         background:rgba(124,58,237,.25);border:2px solid #7c3aed;
+         display:flex;align-items:center;justify-content:center;font-size:40px;">👤</div>
+    <div id="pc-title" style="font-size:13px;color:#9ca3af;letter-spacing:1px;margin-bottom:6px;text-transform:uppercase;">Connecting</div>
+    <div id="pc-sub" style="font-size:20px;font-weight:700;margin-bottom:10px;">Reaching the owner&hellip;</div>
+    <div id="pc-timer" style="font-size:15px;color:#22c55e;font-weight:600;display:none;margin-bottom:30px;font-feature-settings:'tnum';"></div>
+    <div id="pc-msg" style="font-size:13px;color:#9ca3af;line-height:1.6;margin-bottom:26px;min-height:1px;"></div>
+    <div id="pc-controls" style="display:flex;justify-content:center;gap:30px;align-items:center;">
+      <button id="pc-mute-btn" onclick="pcToggleMute()" style="display:none;width:56px;height:56px;border-radius:50%;
+        background:#1e2230;border:1.5px solid #232840;color:#fff;font-size:20px;cursor:pointer;">🎙️</button>
+      <button id="pc-end-btn" onclick="pcEnd()" style="width:64px;height:64px;border-radius:50%;
+        background:#ef4444;border:none;color:#fff;font-size:24px;cursor:pointer;">📵</button>
+    </div>
+    <button id="pc-close-btn" onclick="pcClose()" style="display:none;margin-top:26px;background:transparent;
+       border:1.5px solid #374151;border-radius:13px;padding:11px 22px;color:#9ca3af;font-size:13px;cursor:pointer;font-family:inherit;">
+      Close
+    </button>
+  </div>
+</div>
+
+<script>
+// ── Call via Pasbaan (WebRTC, scanner side) ──
+let pcWs = null;
+let pcPeer = null;
+let pcLocalStream = null;
+let pcRemoteDescSet = false;
+let pcPendingCandidates = [];
+let pcTimerInterval = null;
+let pcSeconds = 0;
+let pcMuted = false;
+let pcEnded = false;
+
+const PC_QR_ID = "{qr_id}";
+
+function pcSetState(title, sub, msg, opts) {{
+  opts = opts || {{}};
+  document.getElementById('pc-title').textContent = title;
+  document.getElementById('pc-sub').textContent = sub;
+  document.getElementById('pc-msg').innerHTML = msg || '';
+  document.getElementById('pc-end-btn').style.display = opts.showEnd === false ? 'none' : 'flex';
+  document.getElementById('pc-mute-btn').style.display = opts.showMute ? 'flex' : 'none';
+  document.getElementById('pc-close-btn').style.display = opts.showClose ? 'inline-block' : 'none';
+  document.getElementById('pc-timer').style.display = opts.showTimer ? 'block' : 'none';
+}}
+
+function pcOpenModal() {{
+  pcEnded = false;
+  document.getElementById('pc-icon').textContent = '👤';
+  document.getElementById('pc-icon').style.background = 'rgba(124,58,237,.25)';
+  document.getElementById('pc-icon').style.borderColor = '#7c3aed';
+  document.getElementById('pc-modal').style.display = 'flex';
+  pcSetState('Connecting', 'Checking owner status…', 'One moment — seeing if the owner app is online.');
+}}
+
+function pcStart() {{
+  pcOpenModal();
+
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  const wsUrl = proto + location.host + '/ws/call/' + PC_QR_ID + '/scanner';
+
+  try {{
+    pcWs = new WebSocket(wsUrl);
+  }} catch (e) {{
+    pcShowError('Could not start the call. Please try again.');
+    return;
+  }}
+
+  pcWs.onmessage = function (evt) {{
+    let msg;
+    try {{ msg = JSON.parse(evt.data); }} catch (e) {{ return; }}
+    pcHandleSignal(msg);
+  }};
+
+  pcWs.onerror = function () {{
+    pcShowError('Connection problem. Please check your internet and try again.');
+  }};
+
+  pcWs.onclose = function () {{
+    if (!pcEnded) {{
+      pcEndedCleanup();
+    }}
+  }};
+}}
+
+function pcHandleSignal(msg) {{
+  if (msg.type === 'status') {{
+    if (msg.online) {{
+      pcSetState('Connecting', 'Ringing the owner…', 'Asking for microphone access…');
+      pcSetupWebRTCAndOffer();
+    }} else {{
+      pcShowOffline();
+    }}
+  }} else if (msg.type === 'answer') {{
+    pcHandleAnswer(msg.sdp);
+  }} else if (msg.type === 'ice') {{
+    pcHandleIce(msg.candidate);
+  }} else if (msg.type === 'rejected') {{
+    pcShowRejected();
+  }} else if (msg.type === 'owner_offline') {{
+    pcShowOffline();
+  }} else if (msg.type === 'end') {{
+    pcEndedCleanup();
+  }}
+}}
+
+async function pcSetupWebRTCAndOffer() {{
+  let iceServers = [ {{ urls: 'stun:stun.l.google.com:19302' }} ];
+  try {{
+    const r = await fetch('/ws/turn-credentials');
+    const d = await r.json();
+    if (d && d.ice_servers) {{ iceServers = d.ice_servers; }}
+  }} catch (e) {{}}
+
+  try {{
+    pcLocalStream = await navigator.mediaDevices.getUserMedia({{ audio: true, video: false }});
+  }} catch (e) {{
+    pcShowError('Microphone permission is needed to make this call.');
+    return;
+  }}
+
+  pcPeer = new RTCPeerConnection({{ iceServers: iceServers }});
+
+  pcLocalStream.getAudioTracks().forEach(function (track) {{
+    pcPeer.addTrack(track, pcLocalStream);
+  }});
+
+  pcPeer.onicecandidate = function (e) {{
+    if (e.candidate && pcWs && pcWs.readyState === 1) {{
+      pcWs.send(JSON.stringify({{ type: 'ice', candidate: e.candidate }}));
+    }}
+  }};
+
+  pcPeer.onconnectionstatechange = function () {{
+    if (!pcPeer) {{ return; }}
+    if (pcPeer.connectionState === 'connected') {{
+      pcSetState('In Call', 'Connected', '', {{ showEnd: true, showMute: true, showTimer: true }});
+      document.getElementById('pc-icon').style.background = 'rgba(34,197,94,.2)';
+      document.getElementById('pc-icon').style.borderColor = '#22c55e';
+      pcStartTimer();
+    }} else if (pcPeer.connectionState === 'failed' || pcPeer.connectionState === 'disconnected') {{
+      pcEndedCleanup();
+    }}
+  }};
+
+  try {{
+    const offer = await pcPeer.createOffer();
+    await pcPeer.setLocalDescription(offer);
+    if (pcWs && pcWs.readyState === 1) {{
+      pcWs.send(JSON.stringify({{ type: 'offer', sdp: offer.sdp }}));
+    }}
+    pcSetState('Calling', 'Ringing the owner…', 'Waiting for them to pick up.');
+  }} catch (e) {{
+    pcShowError('Could not start the call. Please try again.');
+  }}
+}}
+
+async function pcHandleAnswer(sdp) {{
+  if (!pcPeer) {{ return; }}
+  await pcPeer.setRemoteDescription({{ type: 'answer', sdp: sdp }});
+  pcRemoteDescSet = true;
+  for (let i = 0; i < pcPendingCandidates.length; i++) {{
+    try {{ await pcPeer.addIceCandidate(pcPendingCandidates[i]); }} catch (e) {{}}
+  }}
+  pcPendingCandidates = [];
+}}
+
+async function pcHandleIce(candidate) {{
+  if (!candidate) {{ return; }}
+  if (pcRemoteDescSet && pcPeer) {{
+    try {{ await pcPeer.addIceCandidate(candidate); }} catch (e) {{}}
+  }} else {{
+    pcPendingCandidates.push(candidate);
+  }}
+}}
+
+function pcStartTimer() {{
+  pcSeconds = 0;
+  const timerEl = document.getElementById('pc-timer');
+  pcTimerInterval = setInterval(function () {{
+    pcSeconds++;
+    const m = Math.floor(pcSeconds / 60);
+    const s = pcSeconds % 60;
+    timerEl.textContent = m + ':' + (s < 10 ? '0' : '') + s;
+  }}, 1000);
+}}
+
+function pcToggleMute() {{
+  if (!pcLocalStream) {{ return; }}
+  pcMuted = !pcMuted;
+  pcLocalStream.getAudioTracks().forEach(function (t) {{ t.enabled = !pcMuted; }});
+  document.getElementById('pc-mute-btn').style.background = pcMuted ? '#ef4444' : '#1e2230';
+}}
+
+function pcShowOffline() {{
+  pcSetState(
+    'Owner Offline',
+    'Not reachable right now',
+    'The owner is not on the Pasbaan app at the moment. Try "Call Vehicle Owner" above, or use the Emergency Contacts below.',
+    {{ showEnd: false, showClose: true }}
+  );
+  document.getElementById('pc-icon').textContent = '😴';
+  pcCleanupConnections();
+}}
+
+function pcShowRejected() {{
+  pcSetState('Call Declined', 'The owner declined', 'Try again in a moment, or use the Emergency Contacts below.', {{ showEnd: false, showClose: true }});
+  pcCleanupConnections();
+}}
+
+function pcShowError(text) {{
+  pcSetState('Could Not Connect', 'Something went wrong', text, {{ showEnd: false, showClose: true }});
+  pcCleanupConnections();
+}}
+
+function pcEndedCleanup() {{
+  if (pcEnded) {{ return; }}
+  pcEnded = true;
+  clearInterval(pcTimerInterval);
+  const wasConnected = pcPeer && pcPeer.connectionState === 'connected';
+  const finalTime = document.getElementById('pc-timer').textContent;
+  pcCleanupConnections();
+  pcSetState('Call Ended', wasConnected ? ('Lasted ' + finalTime) : 'The call ended', '', {{ showEnd: false, showClose: true }});
+}}
+
+function pcCleanupConnections() {{
+  clearInterval(pcTimerInterval);
+  if (pcLocalStream) {{
+    pcLocalStream.getTracks().forEach(function (t) {{ t.stop(); }});
+    pcLocalStream = null;
+  }}
+  if (pcPeer) {{
+    try {{ pcPeer.close(); }} catch (e) {{}}
+    pcPeer = null;
+  }}
+  pcRemoteDescSet = false;
+  pcPendingCandidates = [];
+}}
+
+function pcEnd() {{
+  pcEnded = true;
+  const wasConnected = pcPeer && pcPeer.connectionState === 'connected';
+  const finalTime = document.getElementById('pc-timer').textContent;
+  if (pcWs && pcWs.readyState === 1) {{
+    pcWs.send(JSON.stringify({{ type: 'end' }}));
+  }}
+  pcCleanupConnections();
+  pcSetState('Call Ended', wasConnected ? ('Lasted ' + finalTime) : 'Call ended', '', {{ showEnd: false, showClose: true }});
+  if (pcWs) {{ try {{ pcWs.close(); }} catch (e) {{}} pcWs = null; }}
+}}
+
+function pcClose() {{
+  document.getElementById('pc-modal').style.display = 'none';
+  pcCleanupConnections();
+  if (pcWs) {{ try {{ pcWs.close(); }} catch (e) {{}} pcWs = null; }}
+}}
+</script>"""
 
     return f"""<!DOCTYPE html><html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">{_css()}<title>Pasbaan — {vehicle_no}</title></head>
@@ -4202,6 +4394,9 @@ sppin.addEventListener('input',()=>{{if(sppin.value.length===4) document.getElem
 
 <!-- CALL OWNER CARD (prominent, at the top) -->
 {owner_call_card}
+
+<!-- CALL VIA PASBAAN (free masked WebRTC call, Premium only) -->
+{masked_call_card}
 
 <!-- LIVE LOCATION CARD (moved up — before emergency numbers) -->
 <div class="card" style="background:linear-gradient(135deg,#f0fdf4 0%,#dcfce7 100%);
@@ -4621,6 +4816,7 @@ function sendLocationToOwner() {{
   tryGetOwner(true);
 }}
 </script>
+{masked_call_modal_script}
 {plan_switch_modal_html}
 </div>
 </body></html>"""
@@ -4638,7 +4834,7 @@ def page_success(qr_id: str, name: str, plan: str = "basic") -> str:
     )
     plan_note = (
         "<p style='font-size:12px;color:#7c3aed;margin-top:8px;line-height:1.6'>"
-        "🔒 Premium: Your numbers are private. Call packs coming soon.</p>"
+        "🔒 Premium: Your numbers are private. Calls go through Pasbaan — scanner never sees your number.</p>"
         if plan == "premium" else
         "<p style='font-size:12px;color:#166534;margin-top:8px;line-height:1.6'>"
         "📞 Basic: Your contact numbers are visible to anyone who scans your sticker.</p>"

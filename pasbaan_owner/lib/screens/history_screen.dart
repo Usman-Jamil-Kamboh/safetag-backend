@@ -1,4 +1,3 @@
-cat > /mnt/user-data/outputs/history_screen.dart << 'DARTEOF'
 // lib/screens/history_screen.dart
 
 import 'dart:convert';
@@ -6,34 +5,28 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
-import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:web_socket_channel/io.dart';
 import '../constants.dart';
 import '../services/auth_service.dart';
 import 'login_screen.dart';
 import 'call_screen.dart';
 
-// ─────────────────────────────────────────────────────────────
-// GLOBAL WebSocket SERVICE SINGLETON
-// Creates a FRESH channel on every connect/reconnect
-// to avoid "Stream has already been listened to" error.
-// ─────────────────────────────────────────────────────────────
+// ── Global WebSocket Service Singleton ──
 class OwnerWsService {
-  static final OwnerWsService _instance = OwnerWsService._();
-  static OwnerWsService get instance => _instance;
+  static final OwnerWsService _i = OwnerWsService._();
+  static OwnerWsService get instance => _i;
   OwnerWsService._();
 
-  WebSocketChannel? _channel;
-  StreamSubscription? _sub;
+  IOWebSocketChannel? _channel;
   Timer? _pingTimer;
   Timer? _reconnectTimer;
   String? _qrId;
   bool _intentionalClose = false;
-  bool _connected = false;
 
   Function(Map<String, dynamic>)? onMessage;
   Function(bool)? onConnectionChange;
 
-  bool get isConnected => _connected;
+  bool get isConnected => _channel != null;
 
   void connect(String qrId) {
     _qrId = qrId;
@@ -44,19 +37,12 @@ class OwnerWsService {
   void _doConnect() {
     if (_qrId == null || _intentionalClose) return;
 
-    // Always cancel old subscription and close old channel first
-    _sub?.cancel();
-    _sub = null;
-    try { _channel?.sink.close(); } catch (_) {}
-    _channel = null;
-    _pingTimer?.cancel();
-
+    // Always create a FRESH channel — never reuse old ones
     try {
-      // Create a FRESH channel every time
-      _channel = WebSocketChannel.connect(Uri.parse(wsOwnerUrl(_qrId!)));
+      _channel = IOWebSocketChannel.connect(Uri.parse(wsOwnerUrl(_qrId!)));
+      onConnectionChange?.call(true);
 
-      // Subscribe to the fresh channel's stream
-      _sub = _channel!.stream.listen(
+      _channel!.stream.listen(
         (raw) {
           try { onMessage?.call(jsonDecode(raw as String)); } catch (_) {}
         },
@@ -65,27 +51,20 @@ class OwnerWsService {
         cancelOnError: false,
       );
 
-      _connected = true;
-      onConnectionChange?.call(true);
-
-      // Ping every 25s to keep alive
+      _pingTimer?.cancel();
       _pingTimer = Timer.periodic(const Duration(seconds: 25), (_) {
         _send({'type': 'ping'});
       });
 
     } catch (e) {
-      _connected = false;
       _onDisconnect();
     }
   }
 
   void _onDisconnect() {
-    _sub?.cancel();
-    _sub = null;
+    _channel = null;
     _pingTimer?.cancel();
-    _connected = false;
     onConnectionChange?.call(false);
-
     if (!_intentionalClose) {
       _reconnectTimer?.cancel();
       _reconnectTimer = Timer(const Duration(seconds: 5), _doConnect);
@@ -102,21 +81,15 @@ class OwnerWsService {
     _intentionalClose = true;
     _pingTimer?.cancel();
     _reconnectTimer?.cancel();
-    _sub?.cancel();
-    _sub = null;
     try { _channel?.sink.close(); } catch (_) {}
     _channel = null;
-    _connected = false;
     onConnectionChange?.call(false);
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// HISTORY SCREEN
-// ─────────────────────────────────────────────────────────────
+// ── History Screen ──
 class HistoryScreen extends StatefulWidget {
   const HistoryScreen({super.key});
-
   @override
   State<HistoryScreen> createState() => _HistoryScreenState();
 }
@@ -174,7 +147,6 @@ class _HistoryScreenState extends State<HistoryScreen>
       if (mounted) setState(() => _wsConnected = c);
     };
     OwnerWsService.instance.connect(_stickerId);
-    setState(() => _wsConnected = OwnerWsService.instance.isConnected);
   }
 
   void _handleSignal(Map<String, dynamic> msg) {
@@ -193,6 +165,11 @@ class _HistoryScreenState extends State<HistoryScreen>
         ),
       ).then((_) {
         _callScreenOpen = false;
+        // Re-register callbacks after returning from call screen
+        OwnerWsService.instance.onMessage = _handleSignal;
+        OwnerWsService.instance.onConnectionChange = (c) {
+          if (mounted) setState(() => _wsConnected = c);
+        };
         _fetchHistory();
       });
     }

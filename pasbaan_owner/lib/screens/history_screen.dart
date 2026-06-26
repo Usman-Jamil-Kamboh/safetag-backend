@@ -1,9 +1,5 @@
+cat > /mnt/user-data/outputs/history_screen.dart << 'DARTEOF'
 // lib/screens/history_screen.dart
-// ─────────────────────────────────────────────────────────────
-// Screen 2 — Call History (Home Screen after login)
-// FIXED: WebSocket now uses a global singleton so it stays
-// alive even when the screen is rebuilt or briefly backgrounded.
-// ─────────────────────────────────────────────────────────────
 
 import 'dart:convert';
 import 'dart:async';
@@ -18,8 +14,8 @@ import 'call_screen.dart';
 
 // ─────────────────────────────────────────────────────────────
 // GLOBAL WebSocket SERVICE SINGLETON
-// Lives outside the widget — survives screen rebuilds,
-// navigation, and brief background periods.
+// Creates a FRESH channel on every connect/reconnect
+// to avoid "Stream has already been listened to" error.
 // ─────────────────────────────────────────────────────────────
 class OwnerWsService {
   static final OwnerWsService _instance = OwnerWsService._();
@@ -27,16 +23,17 @@ class OwnerWsService {
   OwnerWsService._();
 
   WebSocketChannel? _channel;
+  StreamSubscription? _sub;
   Timer? _pingTimer;
   Timer? _reconnectTimer;
   String? _qrId;
   bool _intentionalClose = false;
+  bool _connected = false;
 
-  // Callbacks set by HistoryScreen
   Function(Map<String, dynamic>)? onMessage;
   Function(bool)? onConnectionChange;
 
-  bool get isConnected => _channel != null;
+  bool get isConnected => _connected;
 
   void connect(String qrId) {
     _qrId = qrId;
@@ -46,11 +43,20 @@ class OwnerWsService {
 
   void _doConnect() {
     if (_qrId == null || _intentionalClose) return;
-    try {
-      _channel = WebSocketChannel.connect(Uri.parse(wsOwnerUrl(_qrId!)));
-      onConnectionChange?.call(true);
 
-      _channel!.stream.listen(
+    // Always cancel old subscription and close old channel first
+    _sub?.cancel();
+    _sub = null;
+    try { _channel?.sink.close(); } catch (_) {}
+    _channel = null;
+    _pingTimer?.cancel();
+
+    try {
+      // Create a FRESH channel every time
+      _channel = WebSocketChannel.connect(Uri.parse(wsOwnerUrl(_qrId!)));
+
+      // Subscribe to the fresh channel's stream
+      _sub = _channel!.stream.listen(
         (raw) {
           try { onMessage?.call(jsonDecode(raw as String)); } catch (_) {}
         },
@@ -59,22 +65,27 @@ class OwnerWsService {
         cancelOnError: false,
       );
 
-      // Ping every 25s to keep WS alive through NAT/firewalls
-      _pingTimer?.cancel();
+      _connected = true;
+      onConnectionChange?.call(true);
+
+      // Ping every 25s to keep alive
       _pingTimer = Timer.periodic(const Duration(seconds: 25), (_) {
         _send({'type': 'ping'});
       });
 
     } catch (e) {
+      _connected = false;
       _onDisconnect();
     }
   }
 
   void _onDisconnect() {
-    _channel = null;
+    _sub?.cancel();
+    _sub = null;
     _pingTimer?.cancel();
+    _connected = false;
     onConnectionChange?.call(false);
-    // Auto-reconnect in 5s unless intentionally closed
+
     if (!_intentionalClose) {
       _reconnectTimer?.cancel();
       _reconnectTimer = Timer(const Duration(seconds: 5), _doConnect);
@@ -91,8 +102,11 @@ class OwnerWsService {
     _intentionalClose = true;
     _pingTimer?.cancel();
     _reconnectTimer?.cancel();
-    _channel?.sink.close();
+    _sub?.cancel();
+    _sub = null;
+    try { _channel?.sink.close(); } catch (_) {}
     _channel = null;
+    _connected = false;
     onConnectionChange?.call(false);
   }
 }
@@ -128,13 +142,11 @@ class _HistoryScreenState extends State<HistoryScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    // Clear callbacks but keep WS alive in background
     OwnerWsService.instance.onMessage = null;
     OwnerWsService.instance.onConnectionChange = null;
     super.dispose();
   }
 
-  // Reconnect when app comes back to foreground
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
@@ -265,26 +277,23 @@ class _HistoryScreenState extends State<HistoryScreen>
                     color: _wsConnected ? const Color(0xFF22C55E).withOpacity(0.4) : const Color(0xFF374151),
                   ),
                 ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Container(
-                      width: 7, height: 7,
-                      decoration: BoxDecoration(
-                        color: _wsConnected ? const Color(0xFF22C55E) : const Color(0xFF6B7280),
-                        shape: BoxShape.circle,
-                      ),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Container(
+                    width: 7, height: 7,
+                    decoration: BoxDecoration(
+                      color: _wsConnected ? const Color(0xFF22C55E) : const Color(0xFF6B7280),
+                      shape: BoxShape.circle,
                     ),
-                    const SizedBox(width: 6),
-                    Text(
-                      _wsConnected ? 'Online' : 'Connecting...',
-                      style: TextStyle(
-                        color: _wsConnected ? const Color(0xFF22C55E) : const Color(0xFF6B7280),
-                        fontSize: 11, fontWeight: FontWeight.w600,
-                      ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    _wsConnected ? 'Online' : 'Connecting...',
+                    style: TextStyle(
+                      color: _wsConnected ? const Color(0xFF22C55E) : const Color(0xFF6B7280),
+                      fontSize: 11, fontWeight: FontWeight.w600,
                     ),
-                  ],
-                ),
+                  ),
+                ]),
               ),
             ),
           ),

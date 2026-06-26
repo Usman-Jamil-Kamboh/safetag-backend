@@ -198,12 +198,19 @@ async def owner_ws(websocket: WebSocket, qr_id: str):
     except Exception as e:
         print(f"[Signalling] Owner WS error ({qr_id}): {e}", flush=True)
     finally:
-        room["owner"] = None
-        _cleanup_room(qr_id)
-        # Tell scanner the owner went offline
-        await _send(room.get("scanner") if rooms.get(qr_id) else None,
-                    {"type": "owner_offline"})
-        print(f"[Signalling] Owner disconnected: {qr_id}", flush=True)
+        # CRITICAL: only clear the slot if THIS websocket is still the one
+        # registered. If a newer owner connection has already replaced us
+        # (e.g. this is a stale/old connection whose disconnect is only
+        # being detected late), don't stomp on the live connection.
+        if room.get("owner") is websocket:
+            room["owner"] = None
+            _cleanup_room(qr_id)
+            # Tell scanner the owner went offline
+            await _send(room.get("scanner") if rooms.get(qr_id) else None,
+                        {"type": "owner_offline"})
+            print(f"[Signalling] Owner disconnected: {qr_id}", flush=True)
+        else:
+            print(f"[Signalling] Stale owner connection closed (ignored): {qr_id}", flush=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -234,6 +241,16 @@ async def scanner_ws(websocket: WebSocket, qr_id: str):
     await websocket.accept()
 
     room = _get_room(qr_id)
+
+    # If a stale scanner connection from a previous attempt is still
+    # registered, close it — otherwise its late disconnect cleanup can
+    # wipe out THIS new, active connection a few seconds into the call.
+    if room["scanner"] is not None:
+        try:
+            await room["scanner"].close()
+        except Exception:
+            pass
+
     room["scanner"] = websocket
     print(f"[Signalling] Scanner connected: {qr_id}", flush=True)
 
@@ -276,12 +293,18 @@ async def scanner_ws(websocket: WebSocket, qr_id: str):
     except Exception as e:
         print(f"[Signalling] Scanner WS error ({qr_id}): {e}", flush=True)
     finally:
-        room["scanner"] = None
-        _cleanup_room(qr_id)
-        # Tell owner scanner disconnected (in case call was active)
-        if rooms.get(qr_id):
-            await _send(room.get("owner"), {"type": "end"})
-        print(f"[Signalling] Scanner disconnected: {qr_id}", flush=True)
+        # CRITICAL: only clear/notify if THIS websocket is still the one
+        # registered as the active scanner — prevents a late-detected
+        # disconnect from a stale/old connection killing a live call.
+        if room.get("scanner") is websocket:
+            room["scanner"] = None
+            _cleanup_room(qr_id)
+            # Tell owner scanner disconnected (in case call was active)
+            if rooms.get(qr_id):
+                await _send(room.get("owner"), {"type": "end"})
+            print(f"[Signalling] Scanner disconnected: {qr_id}", flush=True)
+        else:
+            print(f"[Signalling] Stale scanner connection closed (ignored): {qr_id}", flush=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

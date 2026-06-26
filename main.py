@@ -4140,6 +4140,9 @@ sppin.addEventListener('input',()=>{{if(sppin.value.length===4) document.getElem
       Close
     </button>
   </div>
+  <!-- Plays the owner's incoming voice — without this element, the
+       browser receives the remote audio track but never renders it. -->
+  <audio id="pc-remote-audio" autoplay playsinline></audio>
 </div>
 
 <script>
@@ -4254,6 +4257,17 @@ async function pcSetupWebRTCAndOffer() {{
     }}
   }};
 
+  // Without this, the owner's voice arrives over WebRTC but is never
+  // played — the browser doesn't auto-render incoming audio like the
+  // Flutter app does, it has to be attached to an <audio> element.
+  pcPeer.ontrack = function (e) {{
+    const audioEl = document.getElementById('pc-remote-audio');
+    if (audioEl && e.streams && e.streams[0]) {{
+      audioEl.srcObject = e.streams[0];
+      audioEl.play().catch(function () {{}});
+    }}
+  }};
+
   pcPeer.onconnectionstatechange = function () {{
     if (!pcPeer) {{ return; }}
     if (pcPeer.connectionState === 'connected') {{
@@ -4356,6 +4370,8 @@ function pcCleanupConnections() {{
     try {{ pcPeer.close(); }} catch (e) {{}}
     pcPeer = null;
   }}
+  const audioEl = document.getElementById('pc-remote-audio');
+  if (audioEl) {{ audioEl.srcObject = null; }}
   pcRemoteDescSet = false;
   pcPendingCandidates = [];
 }}

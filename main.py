@@ -8,7 +8,7 @@ SCAN LOGIC:    scan_count==0 → plan selection → owner setup | scan_count>=1 
 
 PLANS:
   basic   — Rs. 399/6 months — public phone numbers shown on contact page
-  premium — Rs. 399/6 months + call packs — masked online calling via Pasbaan (active)
+  premium — Rs. 399/6 months + call packs — masked calling via Twilio (coming soon)
 """
 
 import hashlib, hmac, io, json, os, secrets, sys, time, zipfile
@@ -156,20 +156,14 @@ def _bg_init_db(retries: int = 15, delay: float = 3.0):
     for attempt in range(1, retries + 1):
         try:
             init_db()
+            run_app_migrations()
             print("[Pasbaan] Database initialised successfully.", file=sys.stderr)
-            break
+            return
         except Exception as _e:
             print(f"[Pasbaan] init_db attempt {attempt}/{retries} failed: {_e}", file=sys.stderr)
             if attempt < retries:
                 time.sleep(delay)
-    else:
-        print("[Pasbaan] WARNING: DB init failed after all retries.", file=sys.stderr)
-        return
-    # Step 3: run Owner App migrations (app_otps table, call_logs columns)
-    try:
-        run_app_migrations()
-    except Exception as _e:
-        print(f"[Pasbaan] WARNING: run_app_migrations failed: {_e}", file=sys.stderr)
+    print("[Pasbaan] WARNING: DB init failed after all retries.", file=sys.stderr)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -181,12 +175,12 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 app.mount("/static", StaticFiles(directory=_STATIC_DIR, check_dir=False), name="static")
 
-# ── Owner App (Flutter) + WebRTC masked-calling routers ─────────────────────
-# These were previously defined in app_routes.py / signalling.py but never
-# wired in, so /app/* and /ws/* were all returning 404 on the live server.
-from app_routes import app_router, run_app_migrations  # noqa: E402
-from signalling import signalling_router                # noqa: E402
+# ── Owner App routes ──
+from app_routes import app_router, run_app_migrations
 app.include_router(app_router)
+
+# ── WebRTC Signalling routes ──
+from signalling import signalling_router
 app.include_router(signalling_router)
 
 
@@ -698,64 +692,6 @@ def db_add_call_pack(qr_id: str, pack_label: str, calls: int):
     conn.commit()
     cur.close()
     release_db(conn)
-
-
-def db_deduct_call_credit(qr_id: str) -> bool:
-    """
-    Deduct 1 call credit from the oldest pack that still has credits left
-    (FIFO). Used when a Premium 'Call via Pasbaan' call actually connects.
-    Returns True if a credit was deducted, False if no credits were available.
-    """
-    conn = get_db()
-    cur  = conn.cursor()
-    try:
-        cur.execute(
-            """
-            UPDATE call_packs
-               SET calls_remaining = calls_remaining - 1
-             WHERE id = (
-                 SELECT id FROM call_packs
-                  WHERE qr_id = %s AND calls_remaining > 0
-                  ORDER BY purchased_at ASC
-                  LIMIT 1
-             )
-            RETURNING id
-            """,
-            (qr_id,)
-        )
-        row = cur.fetchone()
-        conn.commit()
-        return row is not None
-    except Exception:
-        conn.rollback()
-        return False
-    finally:
-        cur.close()
-        release_db(conn)
-
-
-def db_log_call(qr_id: str, status: str, duration_s: Optional[int] = None,
-                 caller_label: str = "Scanner") -> None:
-    """
-    Insert a row into call_logs for a finished/failed call attempt.
-    status: 'completed' | 'rejected' | 'offline' | 'no_answer'
-    Safe no-op on failure — this is best-effort history, never blocks the call flow.
-    """
-    conn = get_db()
-    cur  = conn.cursor()
-    try:
-        cur.execute(
-            """INSERT INTO call_logs (qr_id, contact_idx, duration_s, status, caller_label, ended_at)
-               VALUES (%s, 0, %s, %s, %s, NOW())""",
-            (qr_id, duration_s, status, caller_label)
-        )
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"[Pasbaan] db_log_call failed (non-fatal): {e}", file=sys.stderr)
-    finally:
-        cur.close()
-        release_db(conn)
 
 
 def db_get_call_packs_for_qr(qr_id: str) -> list:
@@ -3358,7 +3294,13 @@ body{{
   </div>
 
   <!-- ── PREMIUM PLAN ── -->
-  <div class="plan premium" style="position:relative">
+  <div class="plan premium" style="opacity:.72;pointer-events:none;user-select:none;position:relative">
+    <div style="position:absolute;top:14px;right:14px;z-index:10;
+                background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff;
+                font-size:11px;font-weight:800;letter-spacing:.07em;
+                padding:4px 12px;border-radius:20px;box-shadow:0 2px 8px rgba(217,119,6,.35)">
+      🚀 COMING SOON
+    </div>
     <div class="plan-top premium-top">
       <div class="plan-label">
         <span class="plan-pill" style="background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff">👑 PREMIUM</span>
@@ -3423,13 +3365,11 @@ body{{
         Each call = 2 minutes. Buy once, use at your own pace.
       </p>
 
-      <form method="POST" action="/scan/{qr_id}/select-plan">
-        <input type="hidden" name="plan" value="premium">
-        <button type="submit" class="plan-btn"
-          style="background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;">
-          👑 Select Premium &rarr;
-        </button>
-      </form>
+      <button type="button" class="plan-btn" disabled
+        style="background:#d1d5db;color:#9ca3af;cursor:not-allowed;
+               box-shadow:none;pointer-events:none;">
+        🚀 Coming Soon
+      </button>
     </div>
   </div>
 
@@ -4125,33 +4065,13 @@ sppin.addEventListener('input',()=>{{if(sppin.value.length===4) document.getElem
 </script>"""
     else:  # basic plan
         plan_switch_html = (
-            '<button onclick="document.getElementById(\'upgrade-modal\').style.display=\'flex\'"'
-            ' style="width:100%;margin-top:6px;padding:11px;'
-            'background:linear-gradient(135deg,#7c3aed,#6d28d9);'
-            'border:none;border-radius:13px;font-size:13px;'
-            'color:#fff;cursor:pointer;font-family:inherit;font-weight:700;">'
-            ' 👑 Upgrade to Premium</button>'
+            '<button disabled'
+            ' style="width:100%;margin-top:6px;padding:11px;background:#f3f4f6;'
+            'border:1.5px solid #e5e7eb;border-radius:13px;font-size:13px;'
+            'color:#9ca3af;cursor:not-allowed;font-family:inherit;pointer-events:none;">'
+            ' \U0001f680 Upgrade to Premium \u2014 Coming Soon</button>'
         )
-        plan_switch_modal_html = (
-            f'<div id="upgrade-modal" style="display:none;position:fixed;inset:0;'
-            'background:rgba(0,0,0,.6);z-index:999;align-items:center;justify-content:center;">'
-            '<div style="background:#fff;border-radius:20px;padding:28px 24px;max-width:340px;width:90%;margin:auto;">'
-            '<h3 style="font-size:18px;font-weight:700;margin-bottom:8px;">👑 Upgrade to Premium</h3>'
-            '<p style="font-size:13px;color:#6b7280;margin-bottom:16px;line-height:1.6;">'
-            'Enter your 4-digit PIN to confirm the upgrade. Your numbers will become private immediately.</p>'
-            f'<form method="POST" action="/scan/{qr_id}/switch-to-premium">'
-            '<input name="pin" type="password" inputmode="numeric" maxlength="4" placeholder="Enter PIN"'
-            ' style="width:100%;padding:12px;border:1.5px solid #e5e7eb;border-radius:12px;'
-            'font-size:20px;text-align:center;letter-spacing:8px;margin-bottom:14px;box-sizing:border-box;">'
-            '<button type="submit"'
-            ' style="width:100%;padding:13px;background:linear-gradient(135deg,#7c3aed,#6d28d9);'
-            'color:#fff;border:none;border-radius:12px;font-size:15px;font-weight:700;cursor:pointer;">'
-            'Confirm Upgrade &rarr;</button></form>'
-            '<button onclick="document.getElementById(\'upgrade-modal\').style.display=\'none\'"'
-            ' style="width:100%;margin-top:10px;padding:11px;background:#f3f4f6;'
-            'border:none;border-radius:12px;font-size:14px;cursor:pointer;">Cancel</button>'
-            '</div></div>'
-        )
+        plan_switch_modal_html = ""
 
 
     return f"""<!DOCTYPE html><html lang="en">
@@ -4605,7 +4525,7 @@ def page_success(qr_id: str, name: str, plan: str = "basic") -> str:
     )
     plan_note = (
         "<p style='font-size:12px;color:#7c3aed;margin-top:8px;line-height:1.6'>"
-        "🔒 Premium: Your numbers are private. Calls go through Pasbaan — scanner never sees your number.</p>"
+        "🔒 Premium: Your numbers are private. Call packs coming soon.</p>"
         if plan == "premium" else
         "<p style='font-size:12px;color:#166534;margin-top:8px;line-height:1.6'>"
         "📞 Basic: Your contact numbers are visible to anyone who scans your sticker.</p>"

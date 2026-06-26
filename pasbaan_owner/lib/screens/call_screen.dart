@@ -64,9 +64,14 @@ class _CallScreenState extends State<CallScreen> {
     else if (type == 'end')   _onCallEnded();
   }
 
+  bool _settingUp = false;
+
   Future<void> _acceptCall() async {
+    if (_settingUp || _callAccepted) return; // ignore double-tap on Accept
+    _settingUp = true;
     setState(() => _callAccepted = true);
     await _setupWebRTC();
+    _settingUp = false;
   }
 
   void _rejectCall() {

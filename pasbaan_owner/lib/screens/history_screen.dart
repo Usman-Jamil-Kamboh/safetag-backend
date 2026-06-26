@@ -18,10 +18,12 @@ class OwnerWsService {
   OwnerWsService._();
 
   IOWebSocketChannel? _channel;
+  StreamSubscription? _channelSub;     // track the active listener explicitly
   Timer? _pingTimer;
   Timer? _reconnectTimer;
   String? _qrId;
   bool _intentionalClose = false;
+  bool _isConnecting = false;          // guards against overlapping connect attempts
 
   Function(Map<String, dynamic>)? onMessage;
   Function(bool)? onConnectionChange;
@@ -36,18 +38,30 @@ class OwnerWsService {
 
   void _doConnect() {
     if (_qrId == null || _intentionalClose) return;
+    // Guard: never start a new connect while one is already in
+    // progress or already connected — this is what was causing
+    // overlapping listeners ("Stream has already been listened to").
+    if (_isConnecting || _channel != null) return;
 
-    // Always create a FRESH channel — never reuse old ones
+    _isConnecting = true;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+
+    // Always tear down any stale listener/channel before creating a new one.
+    _cleanupChannel();
+
     try {
-      _channel = IOWebSocketChannel.connect(Uri.parse(wsOwnerUrl(_qrId!)));
+      final newChannel = IOWebSocketChannel.connect(Uri.parse(wsOwnerUrl(_qrId!)));
+      _channel = newChannel;
+      _isConnecting = false;
       onConnectionChange?.call(true);
 
-      _channel!.stream.listen(
+      _channelSub = newChannel.stream.listen(
         (raw) {
           try { onMessage?.call(jsonDecode(raw as String)); } catch (_) {}
         },
-        onDone: _onDisconnect,
-        onError: (_) => _onDisconnect(),
+        onDone: () => _onDisconnect(newChannel),
+        onError: (_) => _onDisconnect(newChannel),
         cancelOnError: false,
       );
 
@@ -57,12 +71,27 @@ class OwnerWsService {
       });
 
     } catch (e) {
-      _onDisconnect();
+      _isConnecting = false;
+      _onDisconnect(_channel);
     }
   }
 
-  void _onDisconnect() {
+  // Cancels the current subscription and closes the current channel
+  // (if any) WITHOUT touching _qrId/_intentionalClose, so it's safe to
+  // call before every reconnect attempt.
+  void _cleanupChannel() {
+    _channelSub?.cancel();
+    _channelSub = null;
+    try { _channel?.sink.close(); } catch (_) {}
     _channel = null;
+  }
+
+  // [staleChannel] makes sure a late onDone/onError from an OLD channel
+  // (that has already been replaced) can't stomp on a newer connection.
+  void _onDisconnect([IOWebSocketChannel? staleChannel]) {
+    if (staleChannel != null && staleChannel != _channel) return;
+    _isConnecting = false;
+    _cleanupChannel();
     _pingTimer?.cancel();
     onConnectionChange?.call(false);
     if (!_intentionalClose) {
@@ -79,10 +108,10 @@ class OwnerWsService {
 
   void disconnect() {
     _intentionalClose = true;
+    _isConnecting = false;
     _pingTimer?.cancel();
     _reconnectTimer?.cancel();
-    try { _channel?.sink.close(); } catch (_) {}
-    _channel = null;
+    _cleanupChannel();
     onConnectionChange?.call(false);
   }
 }

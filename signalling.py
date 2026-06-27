@@ -48,6 +48,8 @@ import json
 import os
 from typing import Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fcm_push import send_incoming_call_push
+from app_routes import get_fcm_token_for_qr
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TURN SERVER CONFIG  (set these in Render env vars)
@@ -161,6 +163,11 @@ async def owner_ws(websocket: WebSocket, qr_id: str):
     # Tell scanner (if already waiting) that owner is now online
     await _send(room["scanner"], {"type": "owner_online"})
 
+    # If a scanner is already waiting (e.g. owner app was just woken up by
+    # a push notification), let the owner know there's an incoming call too.
+    if room["scanner"] is not None:
+        await _send(websocket, {"type": "incoming_call", "from": "scanner"})
+
     try:
         while True:
             raw = await websocket.receive_text()
@@ -264,6 +271,13 @@ async def scanner_ws(websocket: WebSocket, qr_id: str):
     # If owner is online, notify them of incoming call
     if owner_online:
         await _send(room["owner"], {"type": "incoming_call", "from": "scanner"})
+    else:
+        # Owner's app isn't connected (closed/killed/no network) — try to
+        # wake it up with a push notification. The scanner side will
+        # automatically retry once it gets an "owner_online" message.
+        fcm_token = get_fcm_token_for_qr(qr_id)
+        if fcm_token:
+            send_incoming_call_push(qr_id, fcm_token)
 
     try:
         while True:

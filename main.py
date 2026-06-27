@@ -4225,6 +4225,14 @@ function pcHandleSignal(msg) {{
     pcShowRejected();
   }} else if (msg.type === 'owner_offline') {{
     pcShowOffline();
+  }} else if (msg.type === 'owner_online') {{
+    // Owner's app just woke up (e.g. from our push notification) —
+    // automatically retry the call instead of leaving the user stuck
+    // on the "offline" screen.
+    if (!pcEnded && !pcPeer) {{
+      pcSetState('Connecting', 'Ringing the owner…', 'Asking for microphone access…');
+      pcSetupWebRTCAndOffer();
+    }}
   }} else if (msg.type === 'end') {{
     pcEndedCleanup();
   }}
@@ -4331,12 +4339,12 @@ function pcToggleMute() {{
 
 function pcShowOffline() {{
   pcSetState(
-    'Owner Offline',
-    'Not reachable right now',
-    'The owner is not on the Pasbaan app at the moment. Try "Call Vehicle Owner" above, or use the Emergency Contacts below.',
+    'Trying to Reach Owner',
+    'Waking up their app…',
+    'The owner\\'s app isn\\'t open right now — we\\'re sending them a notification. This may take a few seconds. If they don\\'t respond, try Emergency Contacts below.',
     {{ showEnd: false, showClose: true }}
   );
-  document.getElementById('pc-icon').textContent = '😴';
+  document.getElementById('pc-icon').textContent = '🔔';
   pcCleanupConnections();
 }}
 

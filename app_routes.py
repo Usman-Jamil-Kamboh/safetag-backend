@@ -139,6 +139,14 @@ def _migrate_app_tables():
     except Exception:
         conn.rollback()
 
+    # Add fcm_token column to qr_codes — stores the owner app's push
+    # notification token so we can wake it up when it's closed/killed.
+    try:
+        cur.execute("ALTER TABLE qr_codes ADD COLUMN fcm_token TEXT DEFAULT NULL")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
     cur.close()
     release_db(conn)
     print("[Pasbaan App] App tables migrated successfully.", flush=True)
@@ -264,6 +272,28 @@ def _get_owner_row(sticker_id: str) -> Optional[dict]:
     cur.close()
     release_db(conn)
     return dict(row) if row else None
+
+
+def get_fcm_token_for_qr(qr_id: str) -> Optional[str]:
+    """
+    Fetch the stored FCM push token for a sticker, if any.
+    Used by signalling.py to wake the owner app when it's offline.
+    """
+    get_db, release_db = _get_db_funcs()
+    conn = get_db()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT fcm_token FROM qr_codes WHERE qr_id = %s",
+            (qr_id.upper(),)
+        )
+        row = cur.fetchone()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+    finally:
+        cur.close()
+        release_db(conn)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -513,6 +543,52 @@ async def get_me(authorization: Optional[str] = Header(None)):
         "phone":       masked_phone,
         "scan_count":  owner_row.get("scan_count", 0),
     })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT — POST /app/register-fcm-token
+# Flutter app calls this once it has a Firebase token (and again whenever
+# the token refreshes). Lets the backend wake the app via push notification
+# when a call comes in and the owner's WebSocket isn't connected.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FcmTokenBody(BaseModel):
+    fcm_token: str
+
+
+@app_router.post("/register-fcm-token")
+async def register_fcm_token(
+    body: FcmTokenBody,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Flutter app sends: { "fcm_token": "..." }
+    Requires: Authorization: Bearer <token>
+
+    Stores the token against this owner's sticker so the backend can send
+    a push notification (ring/vibrate) when a call arrives and the app's
+    WebSocket connection isn't currently open (e.g. app closed/killed).
+    """
+    payload    = _require_auth(authorization)
+    sticker_id = payload["sticker_id"]
+
+    get_db, release_db = _get_db_funcs()
+    conn = get_db()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE qr_codes SET fcm_token = %s WHERE qr_id = %s",
+            (body.fcm_token, sticker_id)
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="Could not save push token.")
+    finally:
+        cur.close()
+        release_db(conn)
+
+    return JSONResponse({"message": "Token registered."})
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -89,14 +89,16 @@ def _cleanup_room(qr_id: str):
         rooms.pop(qr_id, None)
 
 
-async def _send(ws: Optional[WebSocket], message: dict):
-    """Safely send a JSON message to a WebSocket. Ignores if connection is gone."""
+async def _send(ws: Optional[WebSocket], message: dict) -> bool:
+    """Safely send a JSON message to a WebSocket. Returns True if it
+    actually went out, False if the connection was missing/dead."""
     if ws is None:
-        return
+        return False
     try:
         await ws.send_text(json.dumps(message))
+        return True
     except Exception:
-        pass
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,19 +270,29 @@ async def scanner_ws(websocket: WebSocket, qr_id: str):
         "online": owner_online
     })
 
-    # If owner is online, notify them of incoming call
-    if owner_online:
-        await _send(room["owner"], {"type": "incoming_call", "from": "scanner"})
-    else:
-        # Owner's app isn't connected (closed/killed/no network) — try to
-        # wake it up with a push notification. The scanner side will
-        # automatically retry once it gets an "owner_online" message.
+    def _wake_owner_with_push():
         fcm_token = get_fcm_token_for_qr(qr_id)
         if fcm_token:
             print(f"[Signalling] Owner offline, attempting FCM push for {qr_id}", flush=True)
             send_incoming_call_push(qr_id, fcm_token)
         else:
             print(f"[Signalling] Owner offline, but NO fcm_token stored for {qr_id} — cannot push.", flush=True)
+
+    if owner_online:
+        # The owner LOOKED connected, but the connection may have just died
+        # a moment ago (e.g. app force-closed right as the scanner called)
+        # without the server noticing yet. If the actual send fails, treat
+        # it the same as "owner offline" and fall back to a push.
+        delivered = await _send(room["owner"], {"type": "incoming_call", "from": "scanner"})
+        if not delivered:
+            print(f"[Signalling] Owner looked online but send failed (stale connection) for {qr_id}", flush=True)
+            room["owner"] = None
+            _wake_owner_with_push()
+    else:
+        # Owner's app isn't connected (closed/killed/no network) — try to
+        # wake it up with a push notification. The scanner side will
+        # automatically retry once it gets an "owner_online" message.
+        _wake_owner_with_push()
 
     try:
         while True:

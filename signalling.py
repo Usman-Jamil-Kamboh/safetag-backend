@@ -277,7 +277,10 @@ async def scanner_ws(websocket: WebSocket, qr_id: str):
         # automatically retry once it gets an "owner_online" message.
         fcm_token = get_fcm_token_for_qr(qr_id)
         if fcm_token:
+            print(f"[Signalling] Owner offline, attempting FCM push for {qr_id}", flush=True)
             send_incoming_call_push(qr_id, fcm_token)
+        else:
+            print(f"[Signalling] Owner offline, but NO fcm_token stored for {qr_id} — cannot push.", flush=True)
 
     try:
         while True:

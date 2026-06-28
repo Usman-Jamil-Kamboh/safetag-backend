@@ -580,9 +580,15 @@ async def register_fcm_token(
             "UPDATE qr_codes SET fcm_token = %s WHERE qr_id = %s",
             (body.fcm_token, sticker_id)
         )
+        rows_updated = cur.rowcount
         conn.commit()
-    except Exception:
+        if rows_updated == 0:
+            print(f"[FCM] WARNING: register-fcm-token updated 0 rows for sticker_id={sticker_id!r} — qr_id mismatch?", flush=True)
+        else:
+            print(f"[FCM] Token saved for sticker_id={sticker_id} (token starts: {body.fcm_token[:20]}...)", flush=True)
+    except Exception as e:
         conn.rollback()
+        print(f"[FCM] ERROR saving token for {sticker_id}: {e}", flush=True)
         raise HTTPException(status_code=500, detail="Could not save push token.")
     finally:
         cur.close()

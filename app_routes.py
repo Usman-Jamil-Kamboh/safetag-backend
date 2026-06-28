@@ -289,7 +289,7 @@ def get_fcm_token_for_qr(qr_id: str) -> Optional[str]:
         )
         row = cur.fetchone()
         print(f"[FCM] get_fcm_token_for_qr({qr_id!r}) -> row={row!r}", flush=True)
-        return row[0] if row and row[0] else None
+        return row['fcm_token'] if row and row['fcm_token'] else None
     except Exception as e:
         print(f"[FCM] ERROR in get_fcm_token_for_qr({qr_id!r}): {e}", flush=True)
         return None

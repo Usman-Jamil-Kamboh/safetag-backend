@@ -7,8 +7,8 @@ ADMIN UI:      GET /admin  → beautiful login + dashboard (no browser tools nee
 SCAN LOGIC:    scan_count==0 → plan selection → owner setup | scan_count>=1 → contact page
 
 PLANS:
-  basic   — Rs. 399/6 months — public phone numbers shown on contact page
-  premium — Rs. 399/6 months + call packs — masked online calling via Pasbaan (active)
+  basic   — Rs. 499 / 6 months — public phone numbers shown on contact page
+  premium — Rs. 799 / 6 months — free, unlimited masked calling via Pasbaan
 """
 
 import hashlib, hmac, io, json, os, secrets, sys, time, zipfile
@@ -312,6 +312,23 @@ def init_db():
     except Exception:
         conn.rollback()   # column already exists — that is fine
 
+    # 2e. Add parent_qr_id column — used for emergency-contact "sub-IDs"
+    # (e.g. ST-000123-1, -2, -3). These are virtual login identities, not
+    # physical stickers: each emergency contact logs into the app with
+    # their own sub-ID + the same PIN, and gets their own call room, so
+    # calling them doesn't evict the owner's live connection.
+    try:
+        cur.execute("ALTER TABLE qr_codes ADD COLUMN parent_qr_id TEXT DEFAULT NULL")
+        conn.commit()
+    except Exception:
+        conn.rollback()   # column already exists — that is fine
+
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_qr_codes_parent ON qr_codes(parent_qr_id)")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
     # 3. Create counter table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS qr_counter (
@@ -343,7 +360,10 @@ def init_db():
     """)
     conn.commit()
 
-    # 6. Create call_packs table (Premium only — future use)
+    # 6. Create call_packs table — LEGACY, no longer used. Calling via
+    #    Pasbaan (masked WebRTC) is free and unlimited for Premium owners,
+    #    so per-call credit packs were removed. Table kept only so old
+    #    deployments with existing rows don't error; safe to ignore.
     cur.execute("""
         CREATE TABLE IF NOT EXISTS call_packs (
             id              SERIAL    PRIMARY KEY,
@@ -443,6 +463,75 @@ def db_save_owner(qr_id: str, payload: dict, pin_hash: str):
     release_db(conn)
 
 
+def sync_contact_subids(main_qr_id: str, contacts: list, pin_hash: str, owner_name: str, vehicle_number: str):
+    """
+    Creates/updates/removes emergency-contact "sub-ID" login rows —
+    ST-000123-1, -2, -3 — one per contact, so each emergency contact can
+    log into the owner app with their own ID + the same PIN and get their
+    own call room (calling them doesn't evict the owner's live connection).
+
+    These sub-ID rows are virtual — no physical sticker/QR code exists for
+    them, they only exist so /app/login-pin and the call-signalling system
+    can recognise each contact's device separately.
+
+    Called after every owner_data save (setup + update) so sub-IDs always
+    match the current contacts list and PIN.
+    """
+    conn = get_db()
+    cur  = conn.cursor()
+    try:
+        for i, contact in enumerate(contacts[:3], start=1):
+            sub_id = f"{main_qr_id}-{i}"
+            sub_payload = {
+                "owner_name":      contact.get("name", ""),
+                "owner_phone":     contact.get("phone", ""),
+                "owner_whatsapp":  bool(contact.get("whatsapp")),
+                "vehicle_number":  vehicle_number,
+                "is_contact_login": True,
+                "relation":        contact.get("relation", ""),
+                "linked_owner":    owner_name,
+                "linked_main_id":  main_qr_id,
+            }
+            cur.execute(
+                """
+                INSERT INTO qr_codes (qr_id, owner_data, owner_pin, parent_qr_id, activated_at, is_active)
+                VALUES (%s, %s, %s, %s, NOW(), TRUE)
+                ON CONFLICT (qr_id) DO UPDATE
+                SET owner_data = EXCLUDED.owner_data,
+                    owner_pin  = EXCLUDED.owner_pin,
+                    is_active  = TRUE
+                """,
+                (sub_id, json.dumps(sub_payload), pin_hash, main_qr_id)
+            )
+        # Remove sub-IDs beyond the current contact count (e.g. a contact was deleted)
+        cur.execute(
+            "DELETE FROM qr_codes WHERE parent_qr_id = %s AND qr_id NOT IN %s",
+            (main_qr_id, tuple(f"{main_qr_id}-{i}" for i in range(1, len(contacts[:3]) + 1)) or ("",))
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[Pasbaan] WARNING: sync_contact_subids failed for {main_qr_id}: {e}", file=sys.stderr)
+    finally:
+        cur.close()
+        release_db(conn)
+
+
+def get_contact_subids(main_qr_id: str) -> list:
+    """Returns the list of active emergency-contact sub-IDs for a sticker, in order."""
+    conn = get_db()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute(
+            "SELECT qr_id, owner_data FROM qr_codes WHERE parent_qr_id = %s ORDER BY qr_id",
+            (main_qr_id,)
+        )
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        cur.close()
+        release_db(conn)
+
+
 def db_insert_qr(qr_id: str, theme: str = "classic", vehicle_type: str = "common"):
     conn = get_db()
     cur  = conn.cursor()
@@ -506,7 +595,7 @@ def db_list_by_vehicle_type(vehicle_type: str, page: int = 1, per_page: int = 25
       with whatever plan/status it happens to have (LEFT JOIN).
     - plan='basic' / 'premium' -> management view: only CLAIMED stickers of
       that type AND on that plan (INNER JOIN), with full subscription columns
-      (status, expires_at, call_credits) for Activate/Suspend/Add-Pack.
+      (status, expires_at) for Activate/Suspend.
     - search: optional partial, case-insensitive match on the sticker ID.
     """
     conn   = get_db()
@@ -518,14 +607,9 @@ def db_list_by_vehicle_type(vehicle_type: str, page: int = 1, per_page: int = 25
     if plan:
         cur.execute(
             f"""SELECT q.qr_id, q.scan_count, q.activated_at, q.created_at, q.theme, q.vehicle_type,
-                       q.owner_data, s.status, s.plan, s.expires_at, s.started_at,
-                       COALESCE(cp.total_remaining, 0) AS call_credits
+                       q.owner_data, s.status, s.plan, s.expires_at, s.started_at
                 FROM qr_codes q
                 JOIN subscriptions s ON s.qr_id = q.qr_id
-                LEFT JOIN (
-                    SELECT qr_id, SUM(calls_remaining) AS total_remaining
-                    FROM call_packs GROUP BY qr_id
-                ) cp ON cp.qr_id = q.qr_id
                 WHERE q.vehicle_type = %s AND s.plan = %s AND q.owner_data IS NOT NULL{search_clause}
                 ORDER BY q.activated_at DESC NULLS LAST
                 LIMIT %s OFFSET %s""",
@@ -659,61 +743,8 @@ def db_create_subscription(qr_id: str, plan: str = "basic"):
     release_db(conn)
 
 
-def db_get_call_credits(qr_id: str) -> int:
-    """Return total remaining call credits across all packs for this qr_id."""
-    conn = get_db()
-    cur  = conn.cursor()
-    cur.execute(
-        "SELECT COALESCE(SUM(calls_remaining), 0) AS total FROM call_packs WHERE qr_id = %s",
-        (qr_id,)
-    )
-    row = cur.fetchone()
-    cur.close()
-    release_db(conn)
-    return int(row["total"]) if row else 0
-
-
-
-def db_add_call_pack(qr_id: str, pack_label: str, calls: int):
-    """Admin manually adds a call pack to a QR ID after payment confirmed."""
-    conn = get_db()
-    cur  = conn.cursor()
-    cur.execute(
-        """INSERT INTO call_packs
-               (qr_id, calls_purchased, calls_remaining, pack_label, purchased_at)
-           VALUES (%s, %s, %s, %s, NOW())""",
-        (qr_id, calls, calls, pack_label)
-    )
-    # If subscription is pending_pack, activate it now
-    cur.execute(
-        """UPDATE subscriptions
-              SET status = 'active',
-                  started_at = NOW(),
-                  expires_at = NOW() + INTERVAL '180 days'
-            WHERE qr_id = %s AND status = 'pending_pack'""",
-        (qr_id,)
-    )
-    conn.commit()
-    cur.close()
-    release_db(conn)
-
-
-def db_get_call_packs_for_qr(qr_id: str) -> list:
-    """Return all call pack rows for a given qr_id."""
-    conn = get_db()
-    cur  = conn.cursor()
-    cur.execute(
-        "SELECT * FROM call_packs WHERE qr_id = %s ORDER BY purchased_at DESC",
-        (qr_id,)
-    )
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close()
-    release_db(conn)
-    return rows
-
-
 def db_get_all_subscriptions_for_admin() -> list:
-    """Return all subscriptions with owner info and call credits for admin dashboard."""
+    """Return all subscriptions with owner info for admin dashboard."""
     conn = get_db()
     cur  = conn.cursor()
     cur.execute("""
@@ -725,14 +756,9 @@ def db_get_all_subscriptions_for_admin() -> list:
             s.expires_at,
             s.created_at,
             q.owner_data,
-            q.scan_count,
-            COALESCE(cp.total_remaining, 0) AS call_credits
+            q.scan_count
         FROM subscriptions s
         LEFT JOIN qr_codes q ON q.qr_id = s.qr_id
-        LEFT JOIN (
-            SELECT qr_id, SUM(calls_remaining) AS total_remaining
-            FROM call_packs GROUP BY qr_id
-        ) cp ON cp.qr_id = s.qr_id
         ORDER BY s.created_at DESC
     """)
     rows = [dict(r) for r in cur.fetchall()]
@@ -783,7 +809,7 @@ def is_subscription_blocked(sub: dict) -> bool:
         renewed / admin didn't re-activate.
 
     False when there is no subscription row, or status is something else
-    (e.g. 'pending_pack' is a Premium-only state handled by the buy-calls flow).
+    (e.g. 'pending' before admin manually activates it).
     """
     if not sub:
         return False
@@ -1532,14 +1558,14 @@ def admin_download_zip(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ADMIN — SUBSCRIPTION & CALL PACK MANAGEMENT
-# (Activate / Suspend / Add Pack are now embedded directly inside the
+# ADMIN — SUBSCRIPTION MANAGEMENT
+# (Activate / Suspend are now embedded directly inside the
 #  Basic/Premium sub-tabs nested under /admin/cars, /admin/bikes, /admin/common
 #  — see admin_vehicle_page)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _vehicle_plan_redirect(qr_id: str, plan: str) -> str:
-    """After an activate/suspend/add-pack action, send the admin back to the
+    """After an activate/suspend action, send the admin back to the
     Car/Bike/Common page they came from, with the right plan sub-tab open."""
     rec   = db_get_record(qr_id)
     vtype = rec.get("vehicle_type", "common") if rec else "common"
@@ -1565,24 +1591,6 @@ async def admin_suspend_subscription(qr_id: str, session: str = Cookie(default=N
     sub  = db_get_subscription(qr_id)
     plan = sub.get("plan", "basic") if sub else "basic"
     return RedirectResponse(url=_vehicle_plan_redirect(qr_id, plan), status_code=303)
-
-
-@app.post("/admin/subscriptions/{qr_id}/add-pack")
-async def admin_add_call_pack(
-    qr_id:      str,
-    pack_label: str  = Form(...),
-    calls:      int  = Form(...),
-    session:    str  = Cookie(default=None),
-):
-    """Admin manually adds a call pack to an owner after payment confirmed."""
-    if not is_valid_session(session):
-        raise HTTPException(403, "Not authorised")
-    if calls <= 0 or calls > 10000:
-        raise HTTPException(400, "Invalid call count")
-    # Build a clean label if not provided
-    label = pack_label.strip() or f"{calls}-call pack"
-    db_add_call_pack(qr_id, label, calls)
-    return RedirectResponse(url=_vehicle_plan_redirect(qr_id, "premium"), status_code=303)
 
 
 @app.get("/", include_in_schema=False)
@@ -1617,19 +1625,16 @@ def scan_qr(qr_id: str, request: Request):
         return Response(content=page_deactivated(qr_id).encode("utf-8"), media_type="text/html; charset=utf-8")
     if isinstance(owner_data, str):
         owner_data = json.loads(owner_data)
-    # Fetch subscription info for premium call-credits checkpoint
+    # Fetch subscription info to determine plan (basic/premium)
     sub = db_get_subscription(qr_id)
     if sub and is_subscription_blocked(sub):
         suspended = sub.get("status") == "suspended"
         html = page_subscription_expired(qr_id, suspended=suspended)
         return Response(content=html.encode("utf-8"), media_type="text/html; charset=utf-8")
-    call_credits = 0
     plan = "basic"
     if sub:
         plan = sub.get("plan", "basic")
-        if plan == "premium":
-            call_credits = db_get_call_credits(qr_id)
-    html = page_contact(qr_id, owner_data, record["scan_count"] + 1, plan=plan, call_credits=call_credits)
+    html = page_contact(qr_id, owner_data, record["scan_count"] + 1, plan=plan)
     return Response(content=html.encode("utf-8"), media_type="text/html; charset=utf-8")
 
 
@@ -1808,6 +1813,7 @@ async def save_setup(
         "message":        message.strip(),
     }
     db_save_owner(qr_id, payload, hash_pin(owner_pin))
+    sync_contact_subids(qr_id, contacts, hash_pin(owner_pin), owner_name.strip(), vehicle_number.strip().upper())
 
     # Create subscription record using plan chosen on plan-selection page
     chosen_plan = request.cookies.get(f"plan_{qr_id}", "basic")
@@ -1815,23 +1821,9 @@ async def save_setup(
         chosen_plan = "basic"
     db_create_subscription(qr_id, chosen_plan)
 
-    if chosen_plan == "premium":
-        # Premium owners go straight to the buy-calls page after activation
-        response = HTMLResponse(page_buy_calls(qr_id, new_activation=True, owner_name=owner_name.strip()))
-    else:
-        response = HTMLResponse(page_success(qr_id, owner_name.strip(), chosen_plan))
+    response = HTMLResponse(page_success(qr_id, owner_name.strip(), chosen_plan))
     response.delete_cookie(f"plan_{qr_id}")
     return response
-
-
-@app.get("/scan/{qr_id}/buy-calls", response_class=HTMLResponse)
-def buy_calls_page(qr_id: str):
-    """Public page shown when a Premium owner has run out of call credits."""
-    record = db_get_record(qr_id)
-    if not record or not record["owner_data"]:
-        return Response(content=page_not_found(qr_id).encode("utf-8"),
-                        media_type="text/html; charset=utf-8", status_code=404)
-    return HTMLResponse(page_buy_calls(qr_id))
 
 
 
@@ -1867,19 +1859,27 @@ async def switch_to_basic(qr_id: str, request: Request, pin: str = Form(...)):
 
 @app.post("/scan/{qr_id}/switch-to-premium", response_class=HTMLResponse)
 async def switch_to_premium(qr_id: str, request: Request, pin: str = Form(...)):
-    """PIN-verified upgrade from Basic to Premium, then show buy-calls page."""
+    """PIN-verified upgrade from Basic to Premium — masked calling is free, no pack purchase needed."""
     record = db_get_record(qr_id)
     if not record or not record["owner_data"]:
         raise HTTPException(404, "Not found")
     if record.get("owner_pin") and not verify_pin(pin, record["owner_pin"]):
         return HTMLResponse(_pin_error_page(qr_id, "Incorrect PIN. Plan not changed."))
     db_switch_plan(qr_id, "premium")
-    owner_data = record["owner_data"]
-    if isinstance(owner_data, str):
-        import json as _json
-        owner_data = _json.loads(owner_data)
-    owner_name = owner_data.get("owner_name", "")
-    return HTMLResponse(page_buy_calls(qr_id, new_activation=True, owner_name=owner_name))
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="en">
+<head><meta charset="UTF-8">{_css()}<title>Switched to Premium</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body><div class="wrap">{_logo()}
+<div class="card" style="text-align:center;padding:36px 20px;background:linear-gradient(135deg,#3b1f6e,#6d28d9);border:none;">
+  <div style="font-size:56px;margin-bottom:14px">👑</div>
+  <h2 style="font-size:20px;font-weight:700;color:#fff;margin-bottom:10px">You're now on Premium!</h2>
+  <p style="color:#ddd6fe;font-size:14px;line-height:1.65">
+    Masked calling via Pasbaan is active and free — your numbers are now hidden from every scanner.
+  </p>
+</div>
+<a href="/scan/{qr_id}" class="btn btn-ghost" style="display:block;text-align:center;text-decoration:none;margin-top:10px">
+  View contact page &#8594;</a>
+</div></body></html>""")
 
 @app.post("/scan/{qr_id}/deactivate", response_class=HTMLResponse)
 async def deactivate_qr(qr_id: str, request: Request, pin: str = Form(...)):
@@ -2118,6 +2118,9 @@ async def save_update(
         "message":        message.strip(),
     }
     db_update_owner(qr_id, payload, new_pin_hash)
+    effective_pin_hash = new_pin_hash or record.get("owner_pin")
+    if effective_pin_hash:
+        sync_contact_subids(qr_id, contacts, effective_pin_hash, owner_name.strip(), vehicle_number.strip().upper())
     return HTMLResponse(page_update_success(qr_id, owner_name.strip()))
 
 
@@ -2643,7 +2646,7 @@ def admin_vehicle_page(vehicle_type: str, rows: list, total: int, page: int, per
                               not), with a Plan badge column for a quick split.
     plan='basic'/'premium' -> nested sub-view: only stickers of this type on
                               that plan, with full subscription management
-                              (Activate / Suspend / Add Call Pack) — this is
+                              (Activate / Suspend) — this is
                               where the old standalone /admin/basic and
                               /admin/premium pages now live, scoped per vehicle type.
     """
@@ -2670,17 +2673,6 @@ def admin_vehicle_page(vehicle_type: str, rows: list, total: int, page: int, per
         page_title = vt_label
 
     total_pages = (total + per_page - 1) // per_page
-
-    PACK_OPTIONS = [
-        ("20 calls — Rs. 400",    20),
-        ("50 calls — Rs. 1,000",  50),
-        ("100 calls — Rs. 2,000", 100),
-        ("200 calls — Rs. 4,000", 200),
-    ]
-    pack_options_html = "".join(
-        f'<option value="{plabel}|{pcalls}">{plabel}</option>'
-        for plabel, pcalls in PACK_OPTIONS
-    )
 
     rows_html = ""
     for r in rows:
@@ -2713,12 +2705,6 @@ def admin_vehicle_page(vehicle_type: str, rows: list, total: int, page: int, per
                 except Exception:
                     pass
 
-            credits_cell = ""
-            if is_premium:
-                credits       = int(r.get("call_credits", 0))
-                credits_color = "#ef4444" if credits == 0 else ("#eab308" if credits < 10 else accent)
-                credits_cell  = f'<td style="color:{credits_color};font-weight:600">{credits}</td>'
-
             activate_btn = (
                 f'<form method="POST" action="/admin/subscriptions/{qr_id}/activate" style="display:inline">'
                 f'<button type="submit" class="tbl-btn tbl-btn-green">✅ Activate</button></form>'
@@ -2731,48 +2717,6 @@ def admin_vehicle_page(vehicle_type: str, rows: list, total: int, page: int, per
             )
 
             pack_form = ""
-            if is_premium:
-                pack_form = f"""
-                <details style="margin-top:6px">
-                  <summary style="font-size:11px;font-weight:700;color:#a78bfa;cursor:pointer;padding:4px 0;list-style:none">
-                    ➕ Add Call Pack
-                  </summary>
-                  <form method="POST" action="/admin/subscriptions/{qr_id}/add-pack"
-                        style="margin-top:8px;background:#1a1325;border:1.5px solid #3b1f6e;border-radius:10px;padding:12px;min-width:230px">
-                    <div style="font-size:11px;font-weight:700;color:#a78bfa;margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em">
-                      Add Calls for {qr_id}
-                    </div>
-                    <div style="margin-bottom:8px">
-                      <select name="_preset" id="preset_{qr_id}" onchange="applyPreset(this, '{qr_id}')"
-                              style="width:100%;padding:8px 10px;border-radius:8px;border:1.5px solid #3b1f6e;
-                                     font-size:12px;background:#111;color:#eee;font-family:inherit">
-                        <option value="">— Choose a pack —</option>
-                        {pack_options_html}
-                      </select>
-                    </div>
-                    <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:10px">
-                      <div style="flex:1">
-                        <input type="text" name="pack_label" id="label_{qr_id}" placeholder="Pack label"
-                               style="width:100%;padding:8px 10px;border-radius:8px;border:1.5px solid #3b1f6e;
-                                      font-size:12px;background:#111;color:#eee;font-family:inherit">
-                      </div>
-                      <div style="width:80px">
-                        <input type="number" name="calls" id="calls_{qr_id}" min="1" max="10000" placeholder="20"
-                               style="width:100%;padding:8px 10px;border-radius:8px;border:1.5px solid #3b1f6e;
-                                      font-size:13px;font-weight:700;background:#111;color:#eee;font-family:inherit;text-align:center">
-                      </div>
-                    </div>
-                    <button type="submit"
-                            style="width:100%;padding:9px;background:linear-gradient(135deg,#7c3aed,#6d28d9);
-                                   color:#fff;border:none;border-radius:9px;font-size:12px;font-weight:700;
-                                   cursor:pointer;font-family:inherit">
-                      ✅ Confirm &amp; Add Pack
-                    </button>
-                    <p style="font-size:10px;color:#7c7c8a;margin-top:6px;line-height:1.5">
-                      Only add after confirming payment on JazzCash / Easypaisa.
-                    </p>
-                  </form>
-                </details>"""
 
             rows_html += f"""
             <tr id="row-{qr_id}">
@@ -2781,7 +2725,6 @@ def admin_vehicle_page(vehicle_type: str, rows: list, total: int, page: int, per
               <td>{vehicle_no}</td>
               <td>{status_badge}</td>
               <td>{scans}</td>
-              {credits_cell}
               <td>{expires}</td>
               <td>
                 <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:2px">
@@ -2860,7 +2803,6 @@ def admin_vehicle_page(vehicle_type: str, rows: list, total: int, page: int, per
     if is_plan_view:
         head_cols = (
             "<th>QR ID</th><th>Owner</th><th>Vehicle</th><th>Status</th><th>Scans</th>"
-            + ("<th>Credits</th>" if is_premium else "")
             + "<th>Expires</th><th>Actions</th>"
         )
     else:
@@ -3025,13 +2967,6 @@ function resetCode(qr_id) {{
     else alert('Reset failed.');
   }};
   document.getElementById('confirm-overlay').classList.add('open');
-}}
-function applyPreset(sel, qrId) {{
-  const val = sel.value;
-  if (!val) return;
-  const [label, calls] = val.split('|');
-  document.getElementById('label_' + qrId).value = label;
-  document.getElementById('calls_' + qrId).value = calls;
 }}
 </script>
 </body></html>"""
@@ -3382,18 +3317,6 @@ body{{
 .feat-list li:last-child{{border-bottom:none}}
 .feat-list .fi{{font-size:14px;flex-shrink:0;margin-top:1px}}
 
-/* Pack pricing */
-.pack-grid{{
-  display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:14px;
-}}
-.pack-item{{
-  background:#f5f0ff;border:1.5px solid #ddd6fe;border-radius:10px;
-  padding:9px 11px;
-}}
-.pack-calls{{font-size:13px;font-weight:700;color:#6d28d9}}
-.pack-price{{font-size:12px;color:#888;margin-top:2px}}
-.pack-no-exp{{font-size:11px;color:#7c3aed;margin-top:3px;font-weight:600}}
-
 /* CTA button */
 .plan-btn{{
   width:100%;padding:14px;border:none;border-radius:12px;
@@ -3426,7 +3349,7 @@ body{{
   <!-- Heading -->
   <div class="page-title">
     <h2>Choose Your Plan</h2>
-    <p>Both plans are free for the first 6 months.<br>No payment needed right now.</p>
+    <p>Simple 6-month subscription. No per-call charges, ever.</p>
     <span class="qr-chip">{qr_id}</span>
   </div>
 
@@ -3437,10 +3360,9 @@ body{{
         <span class="plan-pill" style="background:#d1fae5;color:#065f46">🔵 BASIC</span>
       </div>
       <div class="plan-price-row">
-        <span class="plan-price">Rs. 399</span>
+        <span class="plan-price">Rs. 499</span>
         <span class="plan-period">/ 6 months</span>
       </div>
-      <p class="plan-free-note" style="color:#059669">Free for first 6 months</p>
     </div>
     <div class="plan-divider"></div>
     <div class="plan-body">
@@ -3483,10 +3405,9 @@ body{{
         <span class="rec-tag">RECOMMENDED</span>
       </div>
       <div class="plan-price-row">
-        <span class="plan-price">Rs. 399</span>
+        <span class="plan-price">Rs. 799</span>
         <span class="plan-period">/ 6 months</span>
       </div>
-      <p class="plan-free-note" style="color:#7c3aed">Free for first 6 months &nbsp;·&nbsp; <span style="font-weight:400;color:#9ca3af">+ call packs</span></p>
     </div>
     <div class="plan-divider"></div>
     <div class="plan-body">
@@ -3497,8 +3418,8 @@ body{{
         <div>
           <div class="wp-label" style="color:#166534">Who pays for calls?</div>
           <div class="wp-desc" style="color:#15803d">
-            <strong>You pay</strong> — from your pre-bought call pack.
-            The scanner calls through Pasbaan's masked line, <strong>completely free for them</strong>.
+            <strong>Calling is free and unlimited</strong> — included in your 6-month subscription.
+            The scanner calls through Pasbaan's masked line, <strong>completely free for them too</strong>.
             Your real numbers are <strong>never revealed</strong> to anyone.
           </div>
         </div>
@@ -3507,39 +3428,10 @@ body{{
       <ul class="feat-list">
         <li><span class="fi">✅</span><span>Everything in Basic</span></li>
         <li><span class="fi">🔒</span><span><strong>Numbers always private</strong> — hidden from every scanner</span></li>
-        <li><span class="fi">📞</span><span>Masked calling — scanner calls free through Pasbaan</span></li>
-        <li><span class="fi">📦</span><span>Buy call packs anytime — <strong>no expiry ever</strong></span></li>
+        <li><span class="fi">📞</span><span>Masked calling — <strong>free and unlimited</strong> through Pasbaan</span></li>
+        <li><span class="fi">🆘</span><span>Emergency contacts callable via Pasbaan too — auto-fallback if one doesn't answer</span></li>
         <li><span class="fi">🛡️</span><span>Full privacy for your family's numbers</span></li>
       </ul>
-
-      <!-- Call Pack grid -->
-      <p style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
-                color:#9ca3af;margin-bottom:8px">Call Pack Options</p>
-      <div class="pack-grid">
-        <div class="pack-item">
-          <div class="pack-calls">20 calls</div>
-          <div class="pack-price">Rs. 400</div>
-          <div class="pack-no-exp">No expiry</div>
-        </div>
-        <div class="pack-item">
-          <div class="pack-calls">50 calls</div>
-          <div class="pack-price">Rs. 1,000</div>
-          <div class="pack-no-exp">No expiry</div>
-        </div>
-        <div class="pack-item">
-          <div class="pack-calls">100 calls</div>
-          <div class="pack-price">Rs. 2,000</div>
-          <div class="pack-no-exp">No expiry</div>
-        </div>
-        <div class="pack-item">
-          <div class="pack-calls">200 calls</div>
-          <div class="pack-price">Rs. 4,000</div>
-          <div class="pack-no-exp">No expiry</div>
-        </div>
-      </div>
-      <p style="font-size:11px;color:#9ca3af;margin-bottom:14px;line-height:1.5">
-        Each call = 2 minutes. Buy once, use at your own pace.
-      </p>
 
       <form method="POST" action="/scan/{qr_id}/select-plan">
         <input type="hidden" name="plan" value="premium">
@@ -3558,16 +3450,16 @@ body{{
     <div class="faq-q">Can I upgrade from Basic to Premium later?</div>
     <div class="faq-a">Yes, anytime from your contact page. Your existing contacts and details stay intact.</div>
 
-    <div class="faq-q">What if my call pack balance runs out?</div>
-    <div class="faq-a">The scanner sees a WhatsApp fallback option and you get an alert to top up. No calls are lost mid-conversation.</div>
+    <div class="faq-q">Does Premium calling have a limit?</div>
+    <div class="faq-a">No — calling through Pasbaan is completely free and unlimited for the full 6-month subscription, for both you and your emergency contacts.</div>
 
-    <div class="faq-q">Do call packs expire?</div>
-    <div class="faq-a">Never. Buy 200 calls today and use the last one two years from now — completely fine.</div>
+    <div class="faq-q">What happens after 6 months?</div>
+    <div class="faq-a">You'll get a renewal reminder before it expires. Renew anytime to keep your sticker active.</div>
   </div>
 
   <p class="foot-note">
     Pasbaan Pakistan &nbsp;·&nbsp; Secure Vehicle Emergency System<br>
-    Both plans free for first 6 months — no card needed now
+    Basic Rs. 499 / 6 months &nbsp;·&nbsp; Premium Rs. 799 / 6 months
   </p>
 
 </div>
@@ -3582,7 +3474,7 @@ def page_setup(qr_id: str, plan: str = "basic") -> str:
         '''<span style="font-size:22px">👑</span>'''
         '''<div><p style="font-size:13px;font-weight:700;color:#6d28d9;margin-bottom:2px">Premium Plan Selected</p>'''
         '''<p style="font-size:12px;color:#7c3aed;line-height:1.5">'''
-        '''Your phone numbers will be <strong>private</strong>. Call packs can be purchased after activation.</p></div></div></div>'''
+        '''Your phone numbers will be <strong>private</strong>. Calling via Pasbaan is free and unlimited.</p></div></div></div>'''
         if plan == "premium" else
         '''<div class="card" style="background:#f0fdf4;border:1.5px solid #86efac;padding:14px 16px;">'''
         '''<div style="display:flex;align-items:center;gap:10px;">'''
@@ -3762,315 +3654,16 @@ def _to_intl(phone: str) -> str:
     return "+" + digits
 
 
-def page_buy_calls(qr_id: str, new_activation: bool = False, owner_name: str = "") -> str:
-    """
-    Shown in two situations:
-      1. new_activation=True  — immediately after Premium owner fills setup form
-      2. new_activation=False — when a Premium owner's credits hit 0 and scanner tries to call
-    """
-    # Read from environment variables (set in Render dashboard)
-    JAZZCASH_NUM   = OWNER_JAZZCASH
-    EASYPAISA_NUM  = OWNER_EASYPAISA
-    SUPPORT_NUMBER = OWNER_WHATSAPP
-    # Convert local 03xx format to international 923xx for wa.me link
-    _wa = OWNER_WHATSAPP.strip().lstrip("+")
-    if _wa.startswith("0"):
-        _wa = "92" + _wa[1:]
-    elif not _wa.startswith("92"):
-        _wa = "92" + _wa
-    SUPPORT_WA = _wa
 
-    PACK_OPTIONS = [
-        ("20 calls",  "Rs. 400"),
-        ("50 calls",  "Rs. 1,000"),
-        ("100 calls", "Rs. 2,000"),
-        ("200 calls", "Rs. 4,000"),
-    ]
-
-    pack_cards = "".join(
-        f"""<div onclick="selectPack(this, '{calls}', '{price}')"
-               style="background:#faf5ff;border:2px solid #ddd6fe;border-radius:12px;
-                      padding:14px 16px;text-align:center;cursor:pointer;transition:all .15s;"
-               class="pack-card">
-              <div style="font-size:16px;font-weight:800;color:#6d28d9">{calls}</div>
-              <div style="font-size:14px;color:#7c3aed;font-weight:700;margin-top:4px">{price}</div>
-              <div style="font-size:11px;color:#9ca3af;margin-top:3px">No expiry</div>
-            </div>"""
-        for calls, price in PACK_OPTIONS
-    )
-
-    # Header varies depending on context
-    if new_activation:
-        header_html = f"""
-<div class="card" style="background:linear-gradient(135deg,#f0fdf4,#dcfce7);
-     border:1.5px solid #86efac;text-align:center;padding:28px 20px;">
-  <div style="font-size:52px;margin-bottom:12px">✅</div>
-  <div style="display:inline-block;margin-bottom:12px;padding:4px 16px;
-       background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;
-       border-radius:20px;font-size:12px;font-weight:700;letter-spacing:.05em;">👑 PREMIUM PLAN</div>
-  <h2 style="font-size:20px;font-weight:800;color:#166534;margin-bottom:6px">
-    {'Welcome, ' + owner_name + '!' if owner_name else 'Pasbaan Activated!'}
-  </h2>
-  <p style="font-size:13px;color:#166534;line-height:1.65;margin-bottom:6px">
-    Your Pasbaan sticker is now active. 🎉<br>
-    Your 6-month free trial has started — <strong>no payment needed now.</strong>
-  </p>
-  <p style="font-size:13px;color:#15803d;line-height:1.65">
-    To enable <strong>masked calling</strong> right away, buy a call pack below.
-    Your real numbers stay private until someone calls through Pasbaan.
-  </p>
-  <div style="margin-top:12px;background:rgba(255,255,255,.6);border-radius:10px;
-              padding:8px 14px;display:inline-block;font-family:monospace;font-size:12px;color:#9ca3af">
-    Sticker: {qr_id}
-  </div>
-</div>"""
-    else:
-        header_html = f"""
-<div class="card" style="background:linear-gradient(135deg,#faf5ff,#ede9fe);
-     border:1.5px solid #a78bfa;text-align:center;padding:28px 20px;">
-  <div style="font-size:52px;margin-bottom:12px">📵</div>
-  <h2 style="font-size:20px;font-weight:800;color:#5b21b6;margin-bottom:6px">
-    Top Up Call Credits
-  </h2>
-  <p style="font-size:13px;color:#7c3aed;line-height:1.65">
-    Your Pasbaan is on <strong>Premium</strong> but has <strong>0 call credits</strong> left.<br>
-    Buy a pack to restore masked calling instantly.
-  </p>
-  <div style="margin-top:12px;background:rgba(255,255,255,.6);border-radius:10px;
-              padding:8px 14px;display:inline-block;font-family:monospace;font-size:12px;color:#9ca3af">
-    Sticker: {qr_id}
-  </div>
-</div>"""
-
-    return f"""<!DOCTYPE html><html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Buy Call Pack — Pasbaan</title>
-{_css()}
-<style>
-.pack-card.selected {{
-  border-color:#7c3aed !important;
-  background:linear-gradient(135deg,#ede9fe,#ddd6fe) !important;
-  box-shadow:0 0 0 3px rgba(124,58,237,.2);
-  transform:scale(1.03);
-}}
-.copy-row {{
-  display:flex;align-items:center;gap:8px;
-  background:#fff;border:1.5px solid #e5e7eb;border-radius:11px;
-  padding:11px 14px;margin-bottom:10px;
-}}
-.copy-val {{
-  flex:1;font-family:monospace;font-size:16px;font-weight:700;color:#111;
-  letter-spacing:.04em;
-}}
-.copy-btn {{
-  padding:7px 14px;background:#111;color:#fff;border:none;border-radius:8px;
-  font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;
-  transition:opacity .15s;flex-shrink:0;
-}}
-.copy-btn:hover {{ opacity:.8 }}
-.copy-btn.copied {{ background:#16a34a; }}
-.step-num {{
-  width:24px;height:24px;border-radius:50%;background:#7c3aed;color:#fff;
-  font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;
-  flex-shrink:0;margin-top:1px;
-}}
-.step-row {{
-  display:flex;gap:12px;align-items:flex-start;
-  padding:10px 0;border-bottom:1px solid #f0f0ee;font-size:13px;color:#374151;line-height:1.55;
-}}
-.step-row:last-child {{ border-bottom:none; }}
-#selected-pack-info {{
-  display:none;background:#f0fdf4;border:1.5px solid #86efac;border-radius:10px;
-  padding:10px 14px;margin-top:10px;font-size:13px;color:#166534;font-weight:600;
-  text-align:center;
-}}
-</style>
-</head>
-<body><div class="wrap">{_logo()}
-
-{header_html}
-
-<!-- Step 1 — Choose pack -->
-<div class="card">
-  <div class="sec-title">📦 Step 1 — Choose Your Pack</div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:8px">
-    {pack_cards}
-  </div>
-  <div id="selected-pack-info">✅ Selected: <span id="selected-label"></span></div>
-  <p style="font-size:11px;color:#9ca3af;line-height:1.55;text-align:center;margin-top:10px">
-    Each call = up to 2 minutes &nbsp;·&nbsp; Packs never expire &nbsp;·&nbsp; Stackable
-  </p>
-</div>
-
-<!-- Step 2 — Send payment -->
-<div class="card" style="border:1.5px solid #fde68a;background:#fefce8;">
-  <div class="sec-title" style="color:#854d0e">💳 Step 2 — Send Payment</div>
-  <p style="font-size:13px;color:#78350f;margin-bottom:14px;line-height:1.6">
-    Send the exact amount to <strong>either</strong> number below via JazzCash or Easypaisa.
-    Tap <strong>Copy</strong> to copy the number instantly.
-  </p>
-
-  <!-- JazzCash -->
-  <div style="margin-bottom:6px">
-    <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;
-                color:#854d0e;margin-bottom:6px;display:flex;align-items:center;gap:6px">
-      <span style="background:#dc2626;color:#fff;padding:2px 9px;border-radius:20px;font-size:10px">JazzCash</span>
-    </div>
-    <div class="copy-row">
-      <span class="copy-val" id="jc-num">{JAZZCASH_NUM}</span>
-      <button class="copy-btn" onclick="copyNum('jc-num', this)">Copy</button>
-    </div>
-  </div>
-
-  <!-- Easypaisa -->
-  <div>
-    <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;
-                color:#854d0e;margin-bottom:6px;display:flex;align-items:center;gap:6px">
-      <span style="background:#22c55e;color:#fff;padding:2px 9px;border-radius:20px;font-size:10px">Easypaisa</span>
-    </div>
-    <div class="copy-row">
-      <span class="copy-val" id="ep-num">{EASYPAISA_NUM}</span>
-      <button class="copy-btn" onclick="copyNum('ep-num', this)">Copy</button>
-    </div>
-  </div>
-</div>
-
-<!-- Step 3 — Send screenshot -->
-<div class="card" style="border:1.5px solid #bfdbfe;background:#eff6ff;">
-  <div class="sec-title" style="color:#1e40af">📸 Step 3 — Send Screenshot on WhatsApp</div>
-  <div style="margin-bottom:14px">
-    <div class="step-row">
-      <div class="step-num">1</div>
-      <div>Choose your pack above, then take a screenshot of your payment confirmation</div>
-    </div>
-    <div class="step-row">
-      <div class="step-num">2</div>
-      <div>WhatsApp it to us — the message below will include your selected pack and sticker ID automatically:
-        <div class="copy-row" style="margin-top:8px;margin-bottom:0">
-          <span class="copy-val" id="sticker-id">{qr_id}</span>
-          <button class="copy-btn" onclick="copyNum('sticker-id', this)">Copy ID</button>
-        </div>
-      </div>
-    </div>
-    <div class="step-row">
-      <div class="step-num">3</div>
-      <div>We'll add your credits within a few hours ✅</div>
-    </div>
-  </div>
-
-  <a id="wa-send-btn" href="https://wa.me/{SUPPORT_WA}?text=Hi%2C%20I%20want%20to%20buy%20a%20call%20pack%20for%20Pasbaan%20sticker%20{qr_id}"
-     target="_blank" rel="noopener noreferrer"
-     style="display:flex;align-items:center;justify-content:center;gap:10px;
-            padding:14px 20px;background:#16a34a;color:#fff;border-radius:13px;
-            font-size:15px;font-weight:700;text-decoration:none;
-            box-shadow:0 4px 14px rgba(22,163,74,.3);">
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-      <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347z"/>
-      <path d="M12 0C5.373 0 0 5.373 0 12c0 2.124.558 4.118 1.528 5.843L0 24l6.335-1.508A11.954 11.954 0 0012 24c6.627 0 12-5.373 12-12S18.627 0 12 0zm0 21.818a9.795 9.795 0 01-4.98-1.362l-.357-.214-3.762.895.952-3.667-.234-.374A9.77 9.77 0 012.182 12C2.182 6.57 6.57 2.182 12 2.182S21.818 6.57 21.818 12 17.43 21.818 12 21.818z"/>
-    </svg>
-    <span id="wa-btn-text">WhatsApp {OWNER_NAME} — {SUPPORT_NUMBER}</span>
-  </a>
-</div>
-
-<a href="/scan/{qr_id}" class="btn btn-ghost"
-   style="display:block;text-align:center;text-decoration:none;margin-top:4px">
-  ← Back to contact page
-</a>
-
-<p class="note" style="margin-top:14px">Pasbaan Pakistan · Premium Plan · {qr_id}</p>
-</div>
-
-<script>
-const QR_ID = "{qr_id}";
-const SUPPORT_WA = "{SUPPORT_WA}";
-let selectedCalls = "";
-let selectedPrice = "";
-
-function buildWaLink() {{
-  let msg;
-  if (selectedCalls && selectedPrice) {{
-    msg = "Hi, I want to buy the " + selectedCalls + " (" + selectedPrice + ") call pack for Pasbaan sticker " + QR_ID + ". Payment screenshot attached.";
-  }} else {{
-    msg = "Hi, I want to buy a call pack for Pasbaan sticker " + QR_ID + ". Payment screenshot attached.";
-  }}
-  return "https://wa.me/" + SUPPORT_WA + "?text=" + encodeURIComponent(msg);
-}}
-
-function copyNum(elId, btn) {{
-  const val = document.getElementById(elId).textContent.trim();
-  navigator.clipboard.writeText(val).then(() => {{
-    btn.textContent = '✓ Copied';
-    btn.classList.add('copied');
-    setTimeout(() => {{ btn.textContent = elId === 'sticker-id' ? 'Copy ID' : 'Copy'; btn.classList.remove('copied'); }}, 2000);
-  }}).catch(() => {{
-    const ta = document.createElement('textarea');
-    ta.value = val;
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    document.body.removeChild(ta);
-    btn.textContent = '✓ Copied';
-    btn.classList.add('copied');
-    setTimeout(() => {{ btn.textContent = elId === 'sticker-id' ? 'Copy ID' : 'Copy'; btn.classList.remove('copied'); }}, 2000);
-  }});
-}}
-
-function selectPack(el, calls, price) {{
-  document.querySelectorAll('.pack-card').forEach(c => c.classList.remove('selected'));
-  el.classList.add('selected');
-  selectedCalls = calls;
-  selectedPrice = price;
-  document.getElementById('selected-label').textContent = calls + ' — ' + price;
-  document.getElementById('selected-pack-info').style.display = 'block';
-  // Update the WhatsApp button link with the selected pack details
-  document.getElementById('wa-send-btn').href = buildWaLink();
-  document.getElementById('wa-btn-text').textContent = 'WhatsApp — Send ' + calls + ' Pack Request';
-}}
-</script>
-</body></html>"""
-
-
-def page_contact(qr_id: str, data: dict, scan_count: int, plan: str = "basic", call_credits: int = 0) -> str:
+def page_contact(qr_id: str, data: dict, scan_count: int, plan: str = "basic") -> str:
     icons  = ["c-green","c-blue","c-amber"]
     emojis = ["📞","📱","☎️"]
 
-    # ── Premium call-credits checkpoint ──────────────────────────────────────
-    # For Premium users, the owner pays per call via call packs.
-    # If they have 0 credits remaining, we block the call buttons and show a
-    # "Buy Calls" prompt instead so the owner knows to top up.
-    premium_no_credits = (plan == "premium" and call_credits <= 0)
-
     buttons = ""
-    if premium_no_credits:
-        # Show a locked-out state instead of real call buttons
-        buttons = f"""
-<div style="background:linear-gradient(135deg,#fff7ed,#ffedd5);
-     border:1.5px solid #fed7aa;border-radius:14px;padding:18px 16px;
-     margin-bottom:10px;text-align:center;">
-  <div style="font-size:40px;margin-bottom:10px">📵</div>
-  <h3 style="font-size:16px;font-weight:700;color:#9a3412;margin-bottom:6px">
-    Calls Temporarily Unavailable
-  </h3>
-  <p style="font-size:13px;color:#c2410c;line-height:1.65;margin-bottom:14px">
-    The vehicle owner is a <strong>Premium</strong> member but has run out of call credits.
-    Direct calling is unavailable until they top up their pack.
-  </p>
-  <a href="/scan/{qr_id}/buy-calls"
-     style="display:inline-block;padding:12px 24px;
-            background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;
-            border-radius:12px;font-size:14px;font-weight:700;text-decoration:none;
-            box-shadow:0 4px 14px rgba(109,40,217,.3);">
-    📦 Buy Call Pack
-  </a>
-  <p style="font-size:11px;color:#ea580c;margin-top:10px;line-height:1.5">
-    If this is an emergency, use the Pakistan emergency numbers below.
-  </p>
-</div>"""
-    else:
+    if plan != "premium":
+        # Basic plan — real phone numbers shown directly (no masking available).
+        # Premium owners use "Call Emergency Contacts via Pasbaan" instead —
+        # their contacts' real numbers are never exposed on this page.
         for i, c in enumerate(data.get("contacts", [])):
             buttons += f"""<a href="tel:{_to_intl(c['phone'])}" class="call-btn">
           <div class="c-icon {icons[i%3]}">{emojis[i%3]}</div>
@@ -4078,10 +3671,15 @@ def page_contact(qr_id: str, data: dict, scan_count: int, plan: str = "basic", c
                <div class="c-name">{c['name']}</div></div>
           <div class="c-arrow">›</div></a>"""
 
+    # Whether to show the plain-number "Emergency Contacts" card at all —
+    # Premium owners rely entirely on the masked, free Pasbaan call buttons,
+    # so their contacts' real numbers are never shown here.
+    show_plain_contacts_card = (plan != "premium")
+
     # Owner direct call card — uses owner's own phone number
     owner_phone = data.get("owner_phone", "") or (data["contacts"][0]["phone"] if data.get("contacts") else "")
     owner_call_card = ""
-    if owner_phone and not premium_no_credits:
+    if owner_phone and plan != "premium":
         owner_call_card = f"""
 <div class="card" style="background:linear-gradient(135deg,#1e3a5f 0%,#1d4ed8 100%);border:none;padding:20px;">
   <div class="sec-title" style="color:#bfdbfe;margin-bottom:6px;">📞 Call Vehicle Owner</div>
@@ -4105,9 +3703,8 @@ def page_contact(qr_id: str, data: dict, scan_count: int, plan: str = "basic", c
     # ── Call via Pasbaan (WebRTC masked call) ────────────────────────────────
     # Free, in-app call straight to the owner's phone via the signalling
     # server + Flutter owner app — no phone numbers exchanged either side.
-    # Only offered to Premium owners who still have call credits; Basic and
-    # locked-out Premium (0 credits) fall back to the existing tel: buttons.
-    show_masked_call = (plan == "premium" and not premium_no_credits)
+    # All Premium owners get this — calling is free, no credits involved.
+    show_masked_call = (plan == "premium")
     masked_call_card = ""
     if show_masked_call:
         masked_call_card = """<div class="card" id="pc-card" style="background:linear-gradient(135deg,#3b1f6e 0%,#6d28d9 100%);border:none;padding:20px;">
@@ -4115,11 +3712,37 @@ def page_contact(qr_id: str, data: dict, scan_count: int, plan: str = "basic", c
   <p style="font-size:13px;color:#c4b5fd;margin-bottom:14px;line-height:1.6">
     Free, private call straight to the owner's app — numbers stay hidden on both sides.
   </p>
+
   <button onclick="pcStart()" id="pc-start-btn" style="width:100%;display:flex;align-items:center;justify-content:center;gap:10px;padding:16px 18px;
      background:rgba(255,255,255,.14);backdrop-filter:blur(8px);
      border:1.5px solid rgba(255,255,255,.3);border-radius:14px;
      color:#fff;font-size:15px;font-weight:700;cursor:pointer;font-family:inherit;">
     📞 Call via Pasbaan
+  </button>
+</div>"""
+
+    # ── Call Emergency Contacts via Pasbaan (masked, sequential fallback) ──
+    # Each contact has their own sub-ID room (ST-xxxxx-1, -2, -3), so this
+    # never conflicts with the owner's own masked-call connection. If one
+    # contact doesn't pick up within the ring window, the next is tried
+    # automatically — entirely on the browser side, reusing the same
+    # WebRTC call UI as "Call via Pasbaan" above.
+    ec_queue = [
+        {"id": f"{qr_id}-{i+1}", "name": c.get("name", "Contact"), "relation": c.get("relation", "")}
+        for i, c in enumerate(data.get("contacts", [])[:3])
+    ]
+    ec_call_card = ""
+    if show_masked_call and ec_queue:
+        ec_call_card = """<div class="card" id="ec-card" style="background:linear-gradient(135deg,#701a1a 0%,#991b1b 100%);border:none;padding:20px;">
+  <div class="sec-title" style="color:#fecaca;margin-bottom:6px;">🆘 Call Emergency Contacts via Pasbaan</div>
+  <p style="font-size:13px;color:#fca5a5;margin-bottom:14px;line-height:1.6">
+    Free, private call to the family's app. If one doesn't answer, the next is tried automatically.
+  </p>
+  <button onclick="ecStart()" id="ec-start-btn" style="width:100%;display:flex;align-items:center;justify-content:center;gap:10px;padding:16px 18px;
+     background:rgba(255,255,255,.14);backdrop-filter:blur(8px);
+     border:1.5px solid rgba(255,255,255,.3);border-radius:14px;
+     color:#fff;font-size:15px;font-weight:700;cursor:pointer;font-family:inherit;">
+    🆘 Call Emergency Contacts
   </button>
 </div>"""
 
@@ -4336,6 +3959,11 @@ let pcMuted = false;
 let pcEnded = false;
 
 const PC_QR_ID = "{qr_id}";
+const EC_QUEUE = {json.dumps(ec_queue)};
+let ecQueueIndex = -1;
+let ecActive = false;
+let pcRingTimer = null;
+const PC_RING_TIMEOUT_MS = 40000;  // how long to ring one device before trying the next
 
 function pcSetState(title, sub, msg, opts) {{
   opts = opts || {{}};
@@ -4348,20 +3976,39 @@ function pcSetState(title, sub, msg, opts) {{
   document.getElementById('pc-timer').style.display = opts.showTimer ? 'block' : 'none';
 }}
 
+let pcCurrentTargetId = PC_QR_ID;
+let pcCurrentTargetName = "the owner";
+
 function pcOpenModal() {{
   pcEnded = false;
   document.getElementById('pc-icon').textContent = '👤';
   document.getElementById('pc-icon').style.background = 'rgba(124,58,237,.25)';
   document.getElementById('pc-icon').style.borderColor = '#7c3aed';
   document.getElementById('pc-modal').style.display = 'flex';
-  pcSetState('Connecting', 'Checking owner status…', 'One moment — seeing if the owner app is online.');
+  pcSetState('Connecting', 'Checking status…', 'One moment — seeing if ' + pcCurrentTargetName + '\\'s app is online.');
 }}
 
 function pcStart() {{
+  ecActive = false;
+  pcCurrentTargetId = PC_QR_ID;
+  pcCurrentTargetName = 'the owner';
+  pcDial();
+}}
+
+function ecStart() {{
+  if (!EC_QUEUE.length) return;
+  ecActive = true;
+  ecQueueIndex = 0;
+  pcCurrentTargetId = EC_QUEUE[0].id;
+  pcCurrentTargetName = EC_QUEUE[0].name;
+  pcDial();
+}}
+
+function pcDial() {{
   pcOpenModal();
 
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  const wsUrl = proto + location.host + '/ws/call/' + PC_QR_ID + '/scanner';
+  const wsUrl = proto + location.host + '/ws/call/' + pcCurrentTargetId + '/scanner';
 
   try {{
     pcWs = new WebSocket(wsUrl);
@@ -4390,7 +4037,7 @@ function pcStart() {{
 function pcHandleSignal(msg) {{
   if (msg.type === 'status') {{
     if (msg.online) {{
-      pcSetState('Connecting', 'Ringing the owner…', 'Asking for microphone access…');
+      pcSetState('Connecting', 'Ringing ' + pcCurrentTargetName + '…', 'Asking for microphone access…');
       pcSetupWebRTCAndOffer();
     }} else {{
       pcShowOffline();
@@ -4408,7 +4055,7 @@ function pcHandleSignal(msg) {{
     // automatically retry the call instead of leaving the user stuck
     // on the "offline" screen.
     if (!pcEnded && !pcPeer) {{
-      pcSetState('Connecting', 'Ringing the owner…', 'Asking for microphone access…');
+      pcSetState('Connecting', 'Ringing ' + pcCurrentTargetName + '…', 'Asking for microphone access…');
       pcSetupWebRTCAndOffer();
     }}
   }} else if (msg.type === 'end') {{
@@ -4472,7 +4119,13 @@ async function pcSetupWebRTCAndOffer() {{
     if (pcWs && pcWs.readyState === 1) {{
       pcWs.send(JSON.stringify({{ type: 'offer', sdp: offer.sdp }}));
     }}
-    pcSetState('Calling', 'Ringing the owner…', 'Waiting for them to pick up.');
+    pcSetState('Calling', 'Ringing ' + pcCurrentTargetName + '…', 'Waiting for them to pick up.');
+    clearTimeout(pcRingTimer);
+    pcRingTimer = setTimeout(function () {{
+      if (pcPeer && pcPeer.connectionState !== 'connected') {{
+        pcShowNoAnswer();
+      }}
+    }}, PC_RING_TIMEOUT_MS);
   }} catch (e) {{
     pcShowError('Could not start the call. Please try again.');
   }}
@@ -4480,6 +4133,7 @@ async function pcSetupWebRTCAndOffer() {{
 
 async function pcHandleAnswer(sdp) {{
   if (!pcPeer) {{ return; }}
+  clearTimeout(pcRingTimer);
   await pcPeer.setRemoteDescription({{ type: 'answer', sdp: sdp }});
   pcRemoteDescSet = true;
   for (let i = 0; i < pcPendingCandidates.length; i++) {{
@@ -4515,11 +4169,39 @@ function pcToggleMute() {{
   document.getElementById('pc-mute-btn').style.background = pcMuted ? '#ef4444' : '#1e2230';
 }}
 
-function pcShowOffline() {{
+function pcTryNextOrFinish(reasonText) {{
+  clearTimeout(pcRingTimer);
+  if (ecActive && ecQueueIndex < EC_QUEUE.length - 1) {{
+    ecQueueIndex++;
+    pcCurrentTargetId   = EC_QUEUE[ecQueueIndex].id;
+    pcCurrentTargetName = EC_QUEUE[ecQueueIndex].name;
+    pcSetState('Trying Next', 'Trying ' + pcCurrentTargetName + '…', reasonText, {{ showEnd: false }});
+    pcCleanupConnections();
+    setTimeout(function () {{ if (!pcEnded) {{ pcDial(); }} }}, 1200);
+    return true;
+  }}
+  return false;
+}}
+
+function pcShowNoAnswer() {{
+  if (pcTryNextOrFinish('No answer — trying the next contact…')) return;
   pcSetState(
-    'Trying to Reach Owner',
+    'No Answer',
+    pcCurrentTargetName + ' didn\\'t pick up',
+    ecActive ? 'No one answered. Try the numbers below, or call emergency services.' : 'Try again in a moment, or use the Emergency Contacts below.',
+    {{ showEnd: false, showClose: true }}
+  );
+  pcCleanupConnections();
+}}
+
+function pcShowOffline() {{
+  if (pcTryNextOrFinish('Not reachable right now — trying the next contact…')) return;
+  pcSetState(
+    ecActive ? ('Trying to Reach ' + pcCurrentTargetName) : 'Trying to Reach Owner',
     'Waking up their app…',
-    'The owner\\'s app isn\\'t open right now — we\\'re sending them a notification. This may take a few seconds. If they don\\'t respond, try Emergency Contacts below.',
+    ecActive
+      ? 'No one answered. Try the numbers below, or call emergency services.'
+      : 'The owner\\'s app isn\\'t open right now — we\\'re sending them a notification. This may take a few seconds. If they don\\'t respond, try Emergency Contacts below.',
     {{ showEnd: false, showClose: true }}
   );
   document.getElementById('pc-icon').textContent = '🔔';
@@ -4527,7 +4209,13 @@ function pcShowOffline() {{
 }}
 
 function pcShowRejected() {{
-  pcSetState('Call Declined', 'The owner declined', 'Try again in a moment, or use the Emergency Contacts below.', {{ showEnd: false, showClose: true }});
+  if (pcTryNextOrFinish(pcCurrentTargetName + ' declined — trying the next contact…')) return;
+  pcSetState(
+    'Call Declined',
+    pcCurrentTargetName + ' declined',
+    ecActive ? 'No one answered. Try the numbers below, or call emergency services.' : 'Try again in a moment, or use the Emergency Contacts below.',
+    {{ showEnd: false, showClose: true }}
+  );
   pcCleanupConnections();
 }}
 
@@ -4548,6 +4236,7 @@ function pcEndedCleanup() {{
 
 function pcCleanupConnections() {{
   clearInterval(pcTimerInterval);
+  clearTimeout(pcRingTimer);
   if (pcLocalStream) {{
     pcLocalStream.getTracks().forEach(function (t) {{ t.stop(); }});
     pcLocalStream = null;
@@ -4600,6 +4289,9 @@ function pcClose() {{
 <!-- CALL VIA PASBAAN (free masked WebRTC call, Premium only) -->
 {masked_call_card}
 
+<!-- CALL EMERGENCY CONTACTS VIA PASBAAN (masked, sequential fallback) -->
+{ec_call_card}
+
 <!-- LIVE LOCATION CARD (moved up — before emergency numbers) -->
 <div class="card" style="background:linear-gradient(135deg,#f0fdf4 0%,#dcfce7 100%);
      border:1.5px solid #86efac;overflow:hidden;position:relative;">
@@ -4634,12 +4326,12 @@ function pcClose() {{
   </div>
 </div>
 
-<!-- EMERGENCY CONTACTS -->
+{f'''<!-- EMERGENCY CONTACTS -->
 <div class="card" style="border:1.5px solid #e0e7ff;">
   <div class="sec-title" style="color:#3730a3">🆘 Emergency Contacts</div>
   <p style="font-size:13px;color:#6b7280;margin-bottom:14px">Tap any button to call directly.</p>
   {buttons}
-</div>
+</div>''' if show_plain_contacts_card else ''}
 {msg}
 
 <!-- PAKISTAN EMERGENCY NUMBERS -->
@@ -5124,6 +4816,36 @@ inp.addEventListener('input', () => {{
 </body></html>"""
 
 
+def _app_login_ids_card(qr_id: str, contacts: list) -> str:
+    """
+    Shows the owner which login ID belongs to whom for the Pasbaan Owner App —
+    their own Sticker ID, and each emergency contact's Sub-ID. The owner
+    shares each Sub-ID with the relevant family member (same PIN as the
+    sticker's own PIN — no separate PIN per contact).
+    """
+    rows = f"""<div style="display:flex;align-items:center;justify-content:space-between;
+       padding:10px 12px;background:#fff;border-radius:10px;margin-bottom:8px;border:1px solid #dbeafe;">
+    <div><div style="font-size:12px;color:#6b7280;">You (Owner)</div>
+         <code style="font-size:14px;font-weight:700;color:#1e40af;">{qr_id}</code></div>
+  </div>"""
+    for i, c in enumerate(contacts[:3], start=1):
+        if not c.get("name"):
+            continue
+        rows += f"""<div style="display:flex;align-items:center;justify-content:space-between;
+       padding:10px 12px;background:#fff;border-radius:10px;margin-bottom:8px;border:1px solid #dbeafe;">
+    <div><div style="font-size:12px;color:#6b7280;">{c.get('name','')} ({c.get('relation','')})</div>
+         <code style="font-size:14px;font-weight:700;color:#1e40af;">{qr_id}-{i}</code></div>
+  </div>"""
+    return f"""<div class="card" style="background:#f8faff;border:1.5px solid #c7d2fe;">
+  <div class="sec-title" style="color:#3730a3">📱 Owner App Login IDs</div>
+  <p style="font-size:13px;color:#6b7280;margin-bottom:12px;line-height:1.6">
+    Share each ID below with the matching person so they can log into the Pasbaan Owner App
+    and receive calls. Everyone uses the <strong>same PIN</strong> you set for this sticker.
+  </p>
+  {rows}
+</div>"""
+
+
 def page_update(qr_id: str, data: dict) -> str:
     """Pre-filled edit form for owner to update their Pasbaan details."""
     def sel(name, val):
@@ -5159,6 +4881,7 @@ def page_update(qr_id: str, data: dict) -> str:
   </p>
   <p style="font-size:11px;color:#93c5fd;margin-top:6px">Sticker ID: <code>{qr_id}</code></p>
 </div>
+{_app_login_ids_card(qr_id, c)}
 <form action="/scan/{qr_id}/update" method="POST">
   <div class="card" style="background:linear-gradient(135deg,#f8faff 0%,#eef2ff 100%);border:1.5px solid #c7d2fe;">
     <div class="sec-title" style="color:#3730a3">🚗 Your Vehicle</div>

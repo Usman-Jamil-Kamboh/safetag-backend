@@ -32,6 +32,7 @@ THAT'S IT. Your existing main.py is untouched.
 """
 
 import os
+import re
 import time
 import random
 import string
@@ -82,6 +83,10 @@ class OtpVerifyBody(BaseModel):
     sticker_id: str       # e.g. "ST-000001"
     phone:      str       # e.g. "03001234567"
     otp:        str       # 6-digit string e.g. "482910"
+
+class PinLoginBody(BaseModel):
+    sticker_id: str       # e.g. "ST-000001"
+    pin:        str       # 4-digit PIN set during sticker activation
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DB HELPERS
@@ -143,6 +148,22 @@ def _migrate_app_tables():
     # notification token so we can wake it up when it's closed/killed.
     try:
         cur.execute("ALTER TABLE qr_codes ADD COLUMN fcm_token TEXT DEFAULT NULL")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
+    # Add PIN-login attempt tracking columns — used to lock out an account
+    # after repeated wrong PINs, since the sticker ID printed on the car is
+    # not secret (anyone can see/scan it), so brute-force protection on the
+    # PIN itself is what actually keeps the app login safe.
+    try:
+        cur.execute("ALTER TABLE qr_codes ADD COLUMN app_login_fails INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
+    try:
+        cur.execute("ALTER TABLE qr_codes ADD COLUMN app_login_locked_until TIMESTAMP DEFAULT NULL")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -299,8 +320,91 @@ def get_fcm_token_for_qr(qr_id: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ENDPOINT 1 — POST /app/request-otp
+# PIN LOGIN — BRUTE-FORCE PROTECTION
+# The sticker ID is printed on the vehicle and scannable by anyone, so it is
+# NOT a secret. All the security here rests on the 4-digit PIN, which only
+# has 10,000 possible values. These helpers lock an account out after too
+# many wrong PINs so a stranger can't just sit and guess.
 # ─────────────────────────────────────────────────────────────────────────────
+
+MAX_PIN_ATTEMPTS   = 5
+LOCKOUT_MINUTES    = 15
+
+
+def _check_login_lock(sticker_id: str) -> Optional[int]:
+    """
+    Returns minutes remaining if this sticker is currently locked out,
+    or None if login attempts are allowed.
+    """
+    get_db, release_db = _get_db_funcs()
+    conn = get_db()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute(
+            "SELECT app_login_locked_until FROM qr_codes WHERE qr_id = %s",
+            (sticker_id,)
+        )
+        row = cur.fetchone()
+        if not row or not row.get("app_login_locked_until"):
+            return None
+        locked_until = row["app_login_locked_until"]
+        if locked_until.tzinfo is None:
+            locked_until = locked_until.replace(tzinfo=timezone.utc)
+        now = datetime.now(tz=timezone.utc)
+        if now >= locked_until:
+            return None
+        return max(1, int((locked_until - now).total_seconds() // 60) + 1)
+    finally:
+        cur.close()
+        release_db(conn)
+
+
+def _record_failed_login(sticker_id: str) -> None:
+    """Increment the failed-attempt counter; lock the account if the limit is hit."""
+    get_db, release_db = _get_db_funcs()
+    conn = get_db()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute(
+            "UPDATE qr_codes SET app_login_fails = app_login_fails + 1 "
+            "WHERE qr_id = %s RETURNING app_login_fails",
+            (sticker_id,)
+        )
+        row = cur.fetchone()
+        fails = row["app_login_fails"] if row else 0
+        if fails >= MAX_PIN_ATTEMPTS:
+            locked_until = datetime.now(tz=timezone.utc) + timedelta(minutes=LOCKOUT_MINUTES)
+            cur.execute(
+                "UPDATE qr_codes SET app_login_locked_until = %s WHERE qr_id = %s",
+                (locked_until, sticker_id)
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    finally:
+        cur.close()
+        release_db(conn)
+
+
+def _reset_login_attempts(sticker_id: str) -> None:
+    """Clear the failed-attempt counter and lock on successful login."""
+    get_db, release_db = _get_db_funcs()
+    conn = get_db()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE qr_codes SET app_login_fails = 0, app_login_locked_until = NULL "
+            "WHERE qr_id = %s",
+            (sticker_id,)
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    finally:
+        cur.close()
+        release_db(conn)
+
+
 
 @app_router.post("/request-otp")
 async def request_otp(body: OtpRequestBody):
@@ -500,6 +604,95 @@ async def verify_otp(body: OtpVerifyBody):
         owner_name = owner_row["owner_data"].get("name", "Owner")
 
     # Generate JWT
+    token = _make_jwt(sticker_id, phone)
+
+    return JSONResponse({
+        "token":       token,
+        "sticker_id":  sticker_id,
+        "owner_name":  owner_name,
+        "expires_in":  f"{JWT_EXPIRE_DAYS} days",
+        "message":     "Login successful. Welcome to Pasbaan!"
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 2b — POST /app/login-pin
+# Faster, free alternative to OTP login — no SMS cost. Uses the same PIN the
+# owner set during sticker activation on the web (setup/update flow).
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app_router.post("/login-pin")
+async def login_pin(body: PinLoginBody):
+    """
+    Single-step login using Sticker ID + activation PIN — no SMS involved.
+
+    Flutter app sends: { "sticker_id": "ST-000001", "pin": "1234" }
+
+    Security note: the sticker ID is printed on the vehicle and visible to
+    anyone, so it's not secret. All protection here comes from the PIN plus
+    a lockout after MAX_PIN_ATTEMPTS wrong tries (see _record_failed_login).
+
+    Returns: { "token": "eyJ...", "sticker_id": "ST-000001", "owner_name": "Ahmed" }
+    """
+    sticker_id = body.sticker_id.strip().upper()
+    pin        = body.pin.strip()
+
+    if not re.fullmatch(r"\d{4}", pin):
+        raise HTTPException(status_code=400, detail="PIN must be exactly 4 digits.")
+
+    # Check lockout before touching the DB record further
+    locked_minutes = _check_login_lock(sticker_id)
+    if locked_minutes is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many wrong attempts. Try again in {locked_minutes} minute(s)."
+        )
+
+    get_db, release_db = _get_db_funcs()
+    conn = get_db()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute(
+            "SELECT qr_id, owner_data, owner_pin, scan_count FROM qr_codes WHERE qr_id = %s",
+            (sticker_id,)
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        release_db(conn)
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Sticker ID not found.")
+
+    owner_data = row.get("owner_data")
+    if not owner_data:
+        raise HTTPException(
+            status_code=400,
+            detail="This sticker has not been set up yet. Scan the QR code first to register."
+        )
+    if isinstance(owner_data, str):
+        import json as _json
+        owner_data = _json.loads(owner_data)
+
+    stored_hash = row.get("owner_pin")
+    if not stored_hash:
+        raise HTTPException(
+            status_code=400,
+            detail="No PIN set for this sticker yet. Set a PIN from the sticker's web page first."
+        )
+
+    # Reuse main.py's constant-time PIN verification
+    from main import verify_pin
+    if not verify_pin(pin, stored_hash):
+        _record_failed_login(sticker_id)
+        raise HTTPException(status_code=400, detail="Incorrect PIN. Please try again.")
+
+    # Success — clear any failed-attempt counter
+    _reset_login_attempts(sticker_id)
+
+    phone = owner_data.get("owner_phone") or owner_data.get("phone1") or ""
+    owner_name = owner_data.get("name", "Owner")
+
     token = _make_jwt(sticker_id, phone)
 
     return JSONResponse({

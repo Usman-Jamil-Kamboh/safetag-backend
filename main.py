@@ -1593,6 +1593,24 @@ async def admin_suspend_subscription(qr_id: str, session: str = Cookie(default=N
     return RedirectResponse(url=_vehicle_plan_redirect(qr_id, plan), status_code=303)
 
 
+@app.post("/admin/subscriptions/{qr_id}/convert-plan")
+async def admin_convert_plan(qr_id: str, session: str = Cookie(default=None)):
+    """
+    Manually switch a sticker between Basic and Premium from the admin panel
+    — e.g. after collecting the price difference from the owner directly
+    (cash, bank transfer, etc.) outside the normal JazzCash/Easypaisa flow.
+    """
+    if not is_valid_session(session):
+        raise HTTPException(403, "Not authorised")
+    sub = db_get_subscription(qr_id)
+    if not sub:
+        raise HTTPException(404, "No subscription found for this sticker.")
+    current_plan = sub.get("plan", "basic")
+    new_plan = "premium" if current_plan == "basic" else "basic"
+    db_switch_plan(qr_id, new_plan)
+    return RedirectResponse(url=_vehicle_plan_redirect(qr_id, new_plan), status_code=303)
+
+
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/admin", status_code=302)
@@ -2716,6 +2734,13 @@ def admin_vehicle_page(vehicle_type: str, rows: list, total: int, page: int, per
                 if status == "active" else ""
             )
 
+            convert_target = "premium" if plan == "basic" else "basic"
+            convert_label  = "👑 Make Premium" if plan == "basic" else "⬇️ Make Basic"
+            convert_btn = (
+                f'<form method="POST" action="/admin/subscriptions/{qr_id}/convert-plan" style="display:inline">'
+                f'<button type="submit" class="tbl-btn" onclick="return confirm(\'Switch {qr_id} to {convert_target.title()}?\')">{convert_label}</button></form>'
+            )
+
             pack_form = ""
 
             rows_html += f"""
@@ -2731,6 +2756,7 @@ def admin_vehicle_page(vehicle_type: str, rows: list, total: int, page: int, per
                   <a href="/scan/{qr_id}" class="tbl-btn" target="_blank">👁 View</a>
                   {activate_btn}
                   {suspend_btn}
+                  {convert_btn}
                   <button class="tbl-btn tbl-btn-warn" onclick="resetCode('{qr_id}')">↺ Reset</button>
                   <button class="tbl-btn tbl-btn-danger" onclick="deleteCode('{qr_id}')">🗑 Delete</button>
                 </div>

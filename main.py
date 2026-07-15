@@ -3989,7 +3989,9 @@ const EC_QUEUE = {json.dumps(ec_queue)};
 let ecQueueIndex = -1;
 let ecActive = false;
 let pcRingTimer = null;
-const PC_RING_TIMEOUT_MS = 40000;  // how long to ring one device before trying the next
+let pcOfflineWaitTimer = null;
+const PC_RING_TIMEOUT_MS = 40000;    // how long to ring an ONLINE device before trying the next
+const PC_OFFLINE_WAIT_MS = 20000;    // how long to wait for a push notification to wake a device
 
 function pcSetState(title, sub, msg, opts) {{
   opts = opts || {{}};
@@ -4066,7 +4068,7 @@ function pcHandleSignal(msg) {{
       pcSetState('Connecting', 'Ringing ' + pcCurrentTargetName + '…', 'Asking for microphone access…');
       pcSetupWebRTCAndOffer();
     }} else {{
-      pcShowOffline();
+      pcShowOffline(msg.has_device !== false);
     }}
   }} else if (msg.type === 'answer') {{
     pcHandleAnswer(msg.sdp);
@@ -4075,11 +4077,12 @@ function pcHandleSignal(msg) {{
   }} else if (msg.type === 'rejected') {{
     pcShowRejected();
   }} else if (msg.type === 'owner_offline') {{
-    pcShowOffline();
+    pcShowOffline(true);
   }} else if (msg.type === 'owner_online') {{
     // Owner's app just woke up (e.g. from our push notification) —
     // automatically retry the call instead of leaving the user stuck
     // on the "offline" screen.
+    clearTimeout(pcOfflineWaitTimer);
     if (!pcEnded && !pcPeer) {{
       pcSetState('Connecting', 'Ringing ' + pcCurrentTargetName + '…', 'Asking for microphone access…');
       pcSetupWebRTCAndOffer();
@@ -4197,6 +4200,7 @@ function pcToggleMute() {{
 
 function pcTryNextOrFinish(reasonText) {{
   clearTimeout(pcRingTimer);
+  clearTimeout(pcOfflineWaitTimer);
   if (ecActive && ecQueueIndex < EC_QUEUE.length - 1) {{
     ecQueueIndex++;
     pcCurrentTargetId   = EC_QUEUE[ecQueueIndex].id;
@@ -4220,18 +4224,47 @@ function pcShowNoAnswer() {{
   pcCleanupConnections();
 }}
 
-function pcShowOffline() {{
-  if (pcTryNextOrFinish('Not reachable right now — trying the next contact…')) return;
+function pcShowOffline(hasDevice) {{
+  clearTimeout(pcRingTimer);
+  pcCleanupConnections();
+
+  if (!hasDevice) {{
+    // This identity has never opened the app — no push token to wake
+    // anyone, so there's nothing to wait for. Move on immediately.
+    if (pcTryNextOrFinish(pcCurrentTargetName + ' hasn\\'t set up the app yet — trying the next contact…')) return;
+    pcSetState(
+      'Could Not Reach ' + pcCurrentTargetName,
+      'App not set up',
+      ecActive ? 'No one answered. Try the numbers below, or call emergency services.' : 'Ask them to log into the Pasbaan Owner App first.',
+      {{ showEnd: false, showClose: true }}
+    );
+    return;
+  }}
+
+  // A device IS registered but isn't connected right now — a push
+  // notification has been sent to wake it. Give it a real window to
+  // land and reconnect before giving up on this target.
   pcSetState(
     ecActive ? ('Trying to Reach ' + pcCurrentTargetName) : 'Trying to Reach Owner',
     'Waking up their app…',
     ecActive
-      ? 'No one answered. Try the numbers below, or call emergency services.'
+      ? 'Sending a notification — this can take a few seconds.'
       : 'The owner\\'s app isn\\'t open right now — we\\'re sending them a notification. This may take a few seconds. If they don\\'t respond, try Emergency Contacts below.',
     {{ showEnd: false, showClose: true }}
   );
   document.getElementById('pc-icon').textContent = '🔔';
-  pcCleanupConnections();
+
+  clearTimeout(pcOfflineWaitTimer);
+  pcOfflineWaitTimer = setTimeout(function () {{
+    if (pcEnded || pcPeer) return; // already answered / moved on
+    if (pcTryNextOrFinish(pcCurrentTargetName + ' didn\\'t respond — trying the next contact…')) return;
+    pcSetState(
+      'Could Not Reach ' + pcCurrentTargetName,
+      'No response',
+      ecActive ? 'No one answered. Try the numbers below, or call emergency services.' : 'Try again in a moment, or use the Emergency Contacts below.',
+      {{ showEnd: false, showClose: true }}
+    );
+  }}, PC_OFFLINE_WAIT_MS);
 }}
 
 function pcShowRejected() {{
@@ -4263,6 +4296,7 @@ function pcEndedCleanup() {{
 function pcCleanupConnections() {{
   clearInterval(pcTimerInterval);
   clearTimeout(pcRingTimer);
+  clearTimeout(pcOfflineWaitTimer);
   if (pcLocalStream) {{
     pcLocalStream.getTracks().forEach(function (t) {{ t.stop(); }});
     pcLocalStream = null;

@@ -263,15 +263,20 @@ async def scanner_ws(websocket: WebSocket, qr_id: str):
     room["scanner"] = websocket
     print(f"[Signalling] Scanner connected: {qr_id}", flush=True)
 
-    # Immediately tell scanner whether owner is online
+    # Immediately tell scanner whether owner is online, and whether we even
+    # HAVE a push token to try waking them if not. This lets the scanner UI
+    # decide: wait for a push to land (has_device=true) vs. give up right
+    # away and try the next emergency contact (has_device=false — this
+    # device/identity has never opened the app, so there's nothing to wait for).
     owner_online = room["owner"] is not None
+    fcm_token = get_fcm_token_for_qr(qr_id)
     await _send(websocket, {
-        "type":   "status",
-        "online": owner_online
+        "type":       "status",
+        "online":     owner_online,
+        "has_device": bool(owner_online or fcm_token)
     })
 
     def _wake_owner_with_push():
-        fcm_token = get_fcm_token_for_qr(qr_id)
         if fcm_token:
             print(f"[Signalling] Owner offline, attempting FCM push for {qr_id}", flush=True)
             send_incoming_call_push(qr_id, fcm_token)

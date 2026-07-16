@@ -4198,9 +4198,30 @@ function pcToggleMute() {{
   document.getElementById('pc-mute-btn').style.background = pcMuted ? '#ef4444' : '#1e2230';
 }}
 
+// Cleanly ends the CURRENT room's WebSocket without triggering the
+// "Call Ended" UI (that's only for calls the user was actually on).
+// Sends 'end' first so — if the owner's app already answered "incoming_call"
+// and started ringing — their phone stops ringing immediately instead of
+// ringing forever with no idea the scanner gave up.
+function pcTerminateCurrentWs() {{
+  if (!pcWs) return;
+  const ws = pcWs;
+  pcWs = null;
+  ws.onclose = null;
+  ws.onerror = null;
+  ws.onmessage = null;
+  try {{
+    if (ws.readyState === 1) {{
+      ws.send(JSON.stringify({{ type: 'end' }}));
+    }}
+  }} catch (e) {{}}
+  try {{ ws.close(); }} catch (e) {{}}
+}}
+
 function pcTryNextOrFinish(reasonText) {{
   clearTimeout(pcRingTimer);
   clearTimeout(pcOfflineWaitTimer);
+  pcTerminateCurrentWs();
   if (ecActive && ecQueueIndex < EC_QUEUE.length - 1) {{
     ecQueueIndex++;
     pcCurrentTargetId   = EC_QUEUE[ecQueueIndex].id;

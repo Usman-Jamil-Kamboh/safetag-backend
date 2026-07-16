@@ -55,11 +55,14 @@ def _get_firebase_app():
         return None
 
 
-def send_incoming_call_push(qr_id: str, fcm_token: str) -> bool:
+def send_incoming_call_push(qr_id: str, fcm_token: str, caller_name: str = "", vehicle_number: str = "") -> bool:
     """
-    Sends a high-priority push notification that rings + vibrates the
-    owner's phone even if the app is fully closed, using a dedicated
-    'incoming_calls' notification channel (created natively in the app).
+    Wakes the owner's phone with a DATA-ONLY high-priority push — no
+    'notification' field, so Android does NOT auto-display anything itself.
+    Instead, the app's background handler receives this data and shows a
+    proper CallKit-style incoming-call screen (full-screen, continuous ring
+    + vibrate, Accept/Decline) that behaves like a real phone call instead
+    of a one-shot chat notification sound.
 
     Returns True if the push was sent successfully, False otherwise.
     """
@@ -72,25 +75,23 @@ def send_incoming_call_push(qr_id: str, fcm_token: str) -> bool:
     try:
         message = messaging.Message(
             token=fcm_token,
-            notification=messaging.Notification(
-                title="Incoming Call",
-                body="Someone is calling about your vehicle. Tap to answer.",
-            ),
             data={
-                "type":   "incoming_call",
-                "qr_id":  qr_id,
+                "type":           "incoming_call",
+                "qr_id":          qr_id,
+                "caller_name":    caller_name or "Someone",
+                "vehicle_number": vehicle_number or "",
+                # How long (ms) the ringing UI should stay up before
+                # auto-dismissing as a missed call — matches roughly how
+                # long the scanner side will keep waiting for this device.
+                "ring_duration_ms": "45000",
             },
             android=messaging.AndroidConfig(
                 priority="high",
-                notification=messaging.AndroidNotification(
-                    channel_id="incoming_calls",
-                    priority="max",
-                    visibility="public",
-                ),
+                # No `notification=` block here on purpose — data-only.
             ),
         )
         messaging.send(message)
-        print(f"[FCM] Push sent for {qr_id}", flush=True)
+        print(f"[FCM] Data-only call push sent for {qr_id}", flush=True)
         return True
     except Exception as e:
         print(f"[FCM] ERROR sending push for {qr_id}: {e}", flush=True)

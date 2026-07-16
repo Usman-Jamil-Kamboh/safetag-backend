@@ -49,7 +49,7 @@ import os
 from typing import Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fcm_push import send_incoming_call_push
-from app_routes import get_fcm_token_for_qr
+from app_routes import get_fcm_token_for_qr, get_call_display_info
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TURN SERVER CONFIG  (set these in Render env vars)
@@ -99,6 +99,23 @@ async def _send(ws: Optional[WebSocket], message: dict) -> bool:
         return True
     except Exception:
         return False
+
+
+@signalling_router.post("/call/{qr_id}/quick-reject")
+async def quick_reject_call(qr_id: str):
+    """
+    Lightweight HTTP endpoint (not WebSocket) for the owner app's native
+    CallKit "Decline" / ring-timeout action to immediately tell a waiting
+    scanner "no answer here" — without needing a full WebSocket connection,
+    which isn't reliable to open from a near-killed background app process.
+
+    Safe to call even if there's no active call — it's a no-op then.
+    """
+    qr_id = qr_id.upper()
+    room = rooms.get(qr_id)
+    if room and room.get("scanner") is not None:
+        await _send(room["scanner"], {"type": "rejected"})
+    return {"ok": True}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -279,7 +296,8 @@ async def scanner_ws(websocket: WebSocket, qr_id: str):
     def _wake_owner_with_push():
         if fcm_token:
             print(f"[Signalling] Owner offline, attempting FCM push for {qr_id}", flush=True)
-            send_incoming_call_push(qr_id, fcm_token)
+            info = get_call_display_info(qr_id)
+            send_incoming_call_push(qr_id, fcm_token, vehicle_number=info.get("vehicle_number", ""))
         else:
             print(f"[Signalling] Owner offline, but NO fcm_token stored for {qr_id} — cannot push.", flush=True)
 

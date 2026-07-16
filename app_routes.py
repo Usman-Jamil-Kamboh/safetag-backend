@@ -33,6 +33,7 @@ THAT'S IT. Your existing main.py is untouched.
 
 import os
 import re
+import json
 import time
 import random
 import string
@@ -314,6 +315,34 @@ def get_fcm_token_for_qr(qr_id: str) -> Optional[str]:
     except Exception as e:
         print(f"[FCM] ERROR in get_fcm_token_for_qr({qr_id!r}): {e}", flush=True)
         return None
+    finally:
+        cur.close()
+        release_db(conn)
+
+
+def get_call_display_info(qr_id: str) -> dict:
+    """
+    Fetch the vehicle number for this sticker/sub-ID, for display on the
+    owner app's incoming-call screen (e.g. "Call about LEA-1234").
+    """
+    get_db, release_db = _get_db_funcs()
+    conn = get_db()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT owner_data FROM qr_codes WHERE qr_id = %s",
+            (qr_id.upper(),)
+        )
+        row = cur.fetchone()
+        if not row or not row.get("owner_data"):
+            return {"vehicle_number": ""}
+        owner_data = row["owner_data"]
+        if isinstance(owner_data, str):
+            owner_data = json.loads(owner_data)
+        return {"vehicle_number": owner_data.get("vehicle_number", "")}
+    except Exception as e:
+        print(f"[FCM] ERROR in get_call_display_info({qr_id!r}): {e}", flush=True)
+        return {"vehicle_number": ""}
     finally:
         cur.close()
         release_db(conn)

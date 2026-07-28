@@ -19,7 +19,7 @@ import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, Form, HTTPException, Request, Cookie
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response, RedirectResponse
+from fastapi.responses import HTMLResponse, Response, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import qrcode
@@ -387,6 +387,24 @@ def init_db():
             created_at  TIMESTAMP NOT NULL DEFAULT NOW()
         )
     """)
+    conn.commit()
+
+    # 7. Create messages table — lets a scanner send a text message
+    # (optionally with a live location) straight to the owner's app,
+    # without exposing anyone's phone number. Auto-expires after 5 days
+    # (cleaned up lazily whenever messages are fetched — see
+    # db_get_messages_for_qr in app_routes.py).
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id          SERIAL    PRIMARY KEY,
+            qr_id       TEXT      NOT NULL,
+            body        TEXT      NOT NULL,
+            latitude    DOUBLE PRECISION DEFAULT NULL,
+            longitude   DOUBLE PRECISION DEFAULT NULL,
+            created_at  TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_qr_id ON messages(qr_id)")
     conn.commit()
 
     cur.close()
@@ -1955,6 +1973,62 @@ async def activate_qr(qr_id: str, request: Request, pin: str = Form(...)):
 <a href="/scan/{qr_id}" class="btn btn-ghost" style="display:block;text-align:center;text-decoration:none">
   View contact page &#8594;</a>
 </div></body></html>""")
+
+
+@app.post("/scan/{qr_id}/send-message")
+async def send_message_route(
+    qr_id: str,
+    body: str = Form(...),
+    latitude: Optional[float] = Form(None),
+    longitude: Optional[float] = Form(None),
+):
+    """
+    Lets a scanner send a text message (optionally with their live
+    location) straight to the owner's app — no phone number exposed on
+    either side. Used as a fallback when a call doesn't connect, or for
+    any non-urgent note (e.g. "your lights are on").
+
+    Message is stored against the family root sticker ID, so the owner
+    AND every emergency contact see it in their shared inbox.
+    """
+    qr_id = qr_id.upper()
+    record = db_get_record(qr_id)
+    if not record or not record.get("owner_data"):
+        raise HTTPException(status_code=404, detail="Sticker not found or not activated.")
+
+    body = body.strip()
+    if not body:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+    if len(body) > 1000:
+        body = body[:1000]
+
+    conn = get_db()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO messages (qr_id, body, latitude, longitude) VALUES (%s, %s, %s, %s) RETURNING id",
+            (qr_id, body, latitude, longitude)
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="Could not send message. Please try again.")
+    finally:
+        cur.close()
+        release_db(conn)
+
+    # Notify the owner's device (best-effort — message is already saved
+    # either way, so a failed push here doesn't fail the request)
+    try:
+        from app_routes import get_fcm_token_for_qr
+        fcm_token = get_fcm_token_for_qr(qr_id)
+        if fcm_token:
+            from fcm_push import send_message_notification
+            send_message_notification(qr_id, fcm_token, body)
+    except Exception as e:
+        print(f"[Pasbaan] WARNING: message push failed for {qr_id}: {e}", file=sys.stderr)
+
+    return JSONResponse({"ok": True, "message": "Message sent."})
 
 
 @app.post("/scan/{qr_id}/verify-pin", response_class=HTMLResponse)
@@ -4373,6 +4447,30 @@ function pcClose() {{
 <!-- CALL EMERGENCY CONTACTS VIA PASBAAN (masked, sequential fallback) -->
 {ec_call_card}
 
+<!-- SEND A MESSAGE (in-app, privacy-preserving — no number exposed) -->
+<div class="card" id="msg-card" style="background:linear-gradient(135deg,#0c4a6e 0%,#075985 100%);border:none;padding:20px;">
+  <div class="sec-title" style="color:#bae6fd;margin-bottom:6px;">💬 Send a Message</div>
+  <p style="font-size:13px;color:#7dd3fc;margin-bottom:14px;line-height:1.6">
+    Couldn't reach anyone by call? Leave a message — it goes straight to the owner's app, privately.
+  </p>
+  <textarea id="msg-body" maxlength="1000" rows="3" placeholder="e.g. Your car is blocking the driveway, please move it..."
+    style="width:100%;padding:12px 14px;border-radius:12px;border:1.5px solid rgba(255,255,255,.25);
+           background:rgba(255,255,255,.08);color:#fff;font-size:14px;font-family:inherit;
+           resize:vertical;margin-bottom:10px;box-sizing:border-box;"></textarea>
+  <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#bae6fd;margin-bottom:12px;cursor:pointer;">
+    <input type="checkbox" id="msg-loc-toggle" style="width:16px;height:16px;accent-color:#38bdf8;">
+    📍 Include my current location
+  </label>
+  <button onclick="sendInAppMessage()" id="msg-send-btn" style="width:100%;padding:15px;border:none;border-radius:13px;
+     background:rgba(255,255,255,.14);backdrop-filter:blur(8px);
+     border:1.5px solid rgba(255,255,255,.3);color:#fff;font-size:15px;font-weight:700;
+     cursor:pointer;font-family:inherit;">
+    Send Message
+  </button>
+  <div id="msg-status" style="font-size:13px;margin-top:12px;padding:10px 12px;border-radius:10px;
+       text-align:center;display:none;line-height:1.55;background:rgba(255,255,255,.1);"></div>
+</div>
+
 <!-- LIVE LOCATION CARD (moved up — before emergency numbers) -->
 <div class="card" style="background:linear-gradient(135deg,#f0fdf4 0%,#dcfce7 100%);
      border:1.5px solid #86efac;overflow:hidden;position:relative;">
@@ -4619,6 +4717,68 @@ function showContactButtons(lat, lng) {{
     '✅ <strong>Location ready.</strong> Tap <strong>WhatsApp</strong> to send — or SMS as fallback.',
     '#166534', 'rgba(220,252,231,.8)'
   );
+}}
+
+// ── In-app message to owner (privacy-preserving, no number exposed) ──
+function sendInAppMessage() {{
+  const btn    = document.getElementById('msg-send-btn');
+  const body   = document.getElementById('msg-body').value.trim();
+  const status = document.getElementById('msg-status');
+  const wantLoc = document.getElementById('msg-loc-toggle').checked;
+
+  if (!body) {{
+    status.style.display = 'block';
+    status.style.color = '#fecaca';
+    status.textContent = 'Please write a message first.';
+    return;
+  }}
+
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
+
+  function doSend(lat, lng) {{
+    const form = new URLSearchParams();
+    form.append('body', body);
+    if (lat != null) form.append('latitude', lat);
+    if (lng != null) form.append('longitude', lng);
+
+    fetch('/scan/{qr_id}/send-message', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+      body: form.toString()
+    }})
+    .then(r => r.json())
+    .then(data => {{
+      btn.disabled = false;
+      btn.textContent = 'Send Message';
+      status.style.display = 'block';
+      if (data.ok) {{
+        status.style.color = '#bbf7d0';
+        status.textContent = '✅ Message sent to the owner.';
+        document.getElementById('msg-body').value = '';
+      }} else {{
+        status.style.color = '#fecaca';
+        status.textContent = data.detail || 'Could not send. Please try again.';
+      }}
+    }})
+    .catch(() => {{
+      btn.disabled = false;
+      btn.textContent = 'Send Message';
+      status.style.display = 'block';
+      status.style.color = '#fecaca';
+      status.textContent = 'Network error. Please check your connection and try again.';
+    }});
+  }}
+
+  if (wantLoc && navigator.geolocation) {{
+    navigator.geolocation.getCurrentPosition(
+      (pos) => doSend(pos.coords.latitude, pos.coords.longitude),
+      () => doSend(null, null),  // location denied/unavailable — send without it
+      {{ timeout: 8000 }}
+    );
+  }} else {{
+    doSend(null, null);
+  }}
 }}
 
 function sendLocation() {{

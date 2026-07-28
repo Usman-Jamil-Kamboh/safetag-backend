@@ -320,6 +320,30 @@ def get_fcm_token_for_qr(qr_id: str) -> Optional[str]:
         release_db(conn)
 
 
+def get_family_root_qr_id(qr_id: str) -> str:
+    """
+    Resolves any identity (main sticker ID or an emergency-contact sub-ID)
+    to the "family root" — the main sticker ID. Messages are always stored
+    against the root, so the owner AND every emergency contact see the
+    same shared inbox for their vehicle.
+    """
+    get_db, release_db = _get_db_funcs()
+    conn = get_db()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute(
+            "SELECT parent_qr_id FROM qr_codes WHERE qr_id = %s",
+            (qr_id.upper(),)
+        )
+        row = cur.fetchone()
+        if row and row.get("parent_qr_id"):
+            return row["parent_qr_id"]
+        return qr_id.upper()
+    finally:
+        cur.close()
+        release_db(conn)
+
+
 def get_call_display_info(qr_id: str) -> dict:
     """
     Fetch the vehicle number for this sticker/sub-ID, for display on the
@@ -909,3 +933,78 @@ async def get_call_history(
         calls.append(call)
 
     return JSONResponse({"calls": calls, "total": total})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 5 — GET /app/messages
+# ─────────────────────────────────────────────────────────────────────────────
+
+MESSAGE_RETENTION_DAYS = 5
+
+
+@app_router.get("/messages")
+async def get_messages(authorization: Optional[str] = Header(None)):
+    """
+    Returns messages sent by scanners for this owner's vehicle — shared
+    across the whole family (owner + every emergency contact see the same
+    inbox, resolved via the family root sticker ID).
+
+    Messages older than MESSAGE_RETENTION_DAYS are deleted automatically
+    on every fetch — no separate cron job needed.
+
+    Requires: Authorization: Bearer <token>
+
+    Returns:
+    {
+      "messages": [
+        {
+          "id": 1,
+          "body": "Your headlights are on",
+          "latitude": 31.5204,
+          "longitude": 74.3587,
+          "created_at": "2026-07-18T10:30:00"
+        },
+        ...
+      ]
+    }
+    """
+    payload    = _require_auth(authorization)
+    sticker_id = payload["sticker_id"]
+    root_id    = get_family_root_qr_id(sticker_id)
+
+    get_db, release_db = _get_db_funcs()
+    conn = get_db()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    try:
+        # Lazy cleanup — delete anything past the retention window first
+        cur.execute(
+            f"DELETE FROM messages WHERE created_at < NOW() - INTERVAL '{MESSAGE_RETENTION_DAYS} days'"
+        )
+        conn.commit()
+
+        cur.execute(
+            """
+            SELECT id, body, latitude, longitude, created_at
+            FROM messages
+            WHERE qr_id = %s
+            ORDER BY created_at DESC
+            """,
+            (root_id,)
+        )
+        rows = cur.fetchall()
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="Could not fetch messages.")
+    finally:
+        cur.close()
+        release_db(conn)
+
+    messages = []
+    for row in rows:
+        m = dict(row)
+        if m.get("created_at"):
+            m["created_at"] = m["created_at"].isoformat()
+        messages.append(m)
+
+    return JSONResponse({"messages": messages})

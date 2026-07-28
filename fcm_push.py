@@ -55,6 +55,47 @@ def _get_firebase_app():
         return None
 
 
+def send_message_notification(qr_id: str, fcm_token: str, body_preview: str) -> bool:
+    """
+    Sends a normal (not data-only) push notification for a new scanner
+    message. Unlike incoming-call pushes, this doesn't need CallKit —
+    a standard heads-up notification is the right amount of urgency for
+    "someone left you a message", not a full ringing screen.
+    """
+    app = _get_firebase_app()
+    if app is None:
+        return False
+    if not fcm_token:
+        return False
+
+    preview = body_preview.strip()
+    if len(preview) > 80:
+        preview = preview[:77] + "..."
+
+    try:
+        message = messaging.Message(
+            token=fcm_token,
+            notification=messaging.Notification(
+                title="New message about your vehicle",
+                body=preview or "You have a new message on Pasbaan.",
+            ),
+            data={"type": "new_message", "qr_id": qr_id},
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    channel_id="pasbaan_messages",
+                    priority="high",
+                ),
+            ),
+        )
+        messaging.send(message)
+        print(f"[FCM] Message push sent for {qr_id}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[FCM] ERROR sending message push for {qr_id}: {e}", flush=True)
+        return False
+
+
 def send_incoming_call_push(qr_id: str, fcm_token: str, caller_name: str = "", vehicle_number: str = "") -> bool:
     """
     Wakes the owner's phone with a DATA-ONLY high-priority push — no

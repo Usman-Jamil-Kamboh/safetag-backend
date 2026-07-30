@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, Form, HTTPException, Request, Cookie
+from fastapi import FastAPI, Form, HTTPException, Request, Cookie, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -389,16 +389,18 @@ def init_db():
     """)
     conn.commit()
 
-    # 7. Create messages table — lets a scanner send a text message
-    # (optionally with a live location) straight to the owner's app,
-    # without exposing anyone's phone number. Auto-expires after 5 days
-    # (cleaned up lazily whenever messages are fetched — see
-    # db_get_messages_for_qr in app_routes.py).
+    # 7. Create messages table — lets a scanner send a text and/or voice
+    # message (optionally with a live location) straight to the owner's
+    # app, without exposing anyone's phone number. Auto-expires after 5
+    # days (cleaned up lazily whenever messages are fetched — see
+    # GET /app/messages in app_routes.py).
     cur.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id          SERIAL    PRIMARY KEY,
             qr_id       TEXT      NOT NULL,
-            body        TEXT      NOT NULL,
+            body        TEXT      DEFAULT NULL,
+            audio_data  BYTEA     DEFAULT NULL,
+            audio_mime  TEXT      DEFAULT NULL,
             latitude    DOUBLE PRECISION DEFAULT NULL,
             longitude   DOUBLE PRECISION DEFAULT NULL,
             created_at  TIMESTAMP NOT NULL DEFAULT NOW()
@@ -406,6 +408,24 @@ def init_db():
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_qr_id ON messages(qr_id)")
     conn.commit()
+
+    # Backfill columns for deployments where the messages table already
+    # existed before audio support was added.
+    try:
+        cur.execute("ALTER TABLE messages ALTER COLUMN body DROP NOT NULL")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    try:
+        cur.execute("ALTER TABLE messages ADD COLUMN audio_data BYTEA DEFAULT NULL")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    try:
+        cur.execute("ALTER TABLE messages ADD COLUMN audio_mime TEXT DEFAULT NULL")
+        conn.commit()
+    except Exception:
+        conn.rollback()
 
     cur.close()
     release_db(conn)
@@ -1975,17 +1995,21 @@ async def activate_qr(qr_id: str, request: Request, pin: str = Form(...)):
 </div></body></html>""")
 
 
+MAX_VOICE_MESSAGE_BYTES = 5 * 1024 * 1024  # 5 MB — generous for a ~60s voice clip
+
+
 @app.post("/scan/{qr_id}/send-message")
 async def send_message_route(
     qr_id: str,
-    body: str = Form(...),
+    body: Optional[str] = Form(None),
     latitude: Optional[float] = Form(None),
     longitude: Optional[float] = Form(None),
+    audio: Optional[UploadFile] = File(None),
 ):
     """
-    Lets a scanner send a text message (optionally with their live
-    location) straight to the owner's app — no phone number exposed on
-    either side. Used as a fallback when a call doesn't connect, or for
+    Lets a scanner send a text and/or voice message (optionally with their
+    live location) straight to the owner's app — no phone number exposed
+    on either side. Used as a fallback when a call doesn't connect, or for
     any non-urgent note (e.g. "your lights are on").
 
     Message is stored against the family root sticker ID, so the owner
@@ -1996,18 +2020,29 @@ async def send_message_route(
     if not record or not record.get("owner_data"):
         raise HTTPException(status_code=404, detail="Sticker not found or not activated.")
 
-    body = body.strip()
-    if not body:
-        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+    body = (body or "").strip()
     if len(body) > 1000:
         body = body[:1000]
+
+    audio_bytes = None
+    audio_mime  = None
+    if audio is not None:
+        audio_bytes = await audio.read()
+        if len(audio_bytes) > MAX_VOICE_MESSAGE_BYTES:
+            raise HTTPException(status_code=400, detail="Voice message is too long. Please keep it under a minute.")
+        audio_mime = audio.content_type or "audio/webm"
+
+    if not body and not audio_bytes:
+        raise HTTPException(status_code=400, detail="Please write a message or record a voice note.")
 
     conn = get_db()
     cur  = conn.cursor()
     try:
         cur.execute(
-            "INSERT INTO messages (qr_id, body, latitude, longitude) VALUES (%s, %s, %s, %s) RETURNING id",
-            (qr_id, body, latitude, longitude)
+            """INSERT INTO messages (qr_id, body, audio_data, audio_mime, latitude, longitude)
+               VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+            (qr_id, body or None, psycopg2.Binary(audio_bytes) if audio_bytes else None,
+             audio_mime, latitude, longitude)
         )
         conn.commit()
     except Exception as e:
@@ -2024,7 +2059,8 @@ async def send_message_route(
         fcm_token = get_fcm_token_for_qr(qr_id)
         if fcm_token:
             from fcm_push import send_message_notification
-            send_message_notification(qr_id, fcm_token, body)
+            preview = body if body else "🎤 Voice message"
+            send_message_notification(qr_id, fcm_token, preview)
     except Exception as e:
         print(f"[Pasbaan] WARNING: message push failed for {qr_id}: {e}", file=sys.stderr)
 
@@ -4457,10 +4493,41 @@ function pcClose() {{
     style="width:100%;padding:12px 14px;border-radius:12px;border:1.5px solid rgba(255,255,255,.25);
            background:rgba(255,255,255,.08);color:#fff;font-size:14px;font-family:inherit;
            resize:vertical;margin-bottom:10px;box-sizing:border-box;"></textarea>
-  <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#bae6fd;margin-bottom:12px;cursor:pointer;">
-    <input type="checkbox" id="msg-loc-toggle" style="width:16px;height:16px;accent-color:#38bdf8;">
-    📍 Include my current location
-  </label>
+
+  <!-- Voice recorder -->
+  <div id="voice-idle" style="margin-bottom:12px;">
+    <button type="button" onclick="startVoiceRecording()" id="voice-record-btn"
+      style="width:100%;display:flex;align-items:center;justify-content:center;gap:8px;
+             padding:11px;border:1.5px dashed rgba(255,255,255,.35);border-radius:12px;
+             background:rgba(255,255,255,.06);color:#bae6fd;font-size:13.5px;font-weight:600;
+             cursor:pointer;font-family:inherit;">
+      🎤 Or record a voice message instead
+    </button>
+  </div>
+  <div id="voice-recording" style="display:none;margin-bottom:12px;padding:14px;
+       background:rgba(239,68,68,.15);border:1.5px solid rgba(239,68,68,.4);border-radius:12px;
+       text-align:center;">
+    <div style="font-size:13px;color:#fecaca;margin-bottom:8px;">
+      🔴 Recording… <span id="voice-timer">0:00</span>
+    </div>
+    <button type="button" onclick="stopVoiceRecording()"
+      style="padding:9px 20px;border:none;border-radius:10px;background:#ef4444;color:#fff;
+             font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;">
+      ⬛ Stop Recording
+    </button>
+  </div>
+  <div id="voice-preview" style="display:none;margin-bottom:12px;padding:12px;
+       background:rgba(255,255,255,.08);border-radius:12px;
+       align-items:center;gap:10px;">
+    <audio id="voice-audio-el" controls style="flex:1;height:36px;"></audio>
+    <button type="button" onclick="discardVoiceRecording()" title="Remove"
+      style="width:32px;height:32px;border:none;border-radius:8px;background:rgba(239,68,68,.25);
+             color:#fecaca;font-size:14px;cursor:pointer;flex-shrink:0;">✕</button>
+  </div>
+
+  <p style="font-size:11.5px;color:#7dd3fc;margin-bottom:12px;display:flex;align-items:center;gap:5px;">
+    📍 Your current location is shared automatically with the owner.
+  </p>
   <button onclick="sendInAppMessage()" id="msg-send-btn" style="width:100%;padding:15px;border:none;border-radius:13px;
      background:rgba(255,255,255,.14);backdrop-filter:blur(8px);
      border:1.5px solid rgba(255,255,255,.3);color:#fff;font-size:15px;font-weight:700;
@@ -4719,17 +4786,82 @@ function showContactButtons(lat, lng) {{
   );
 }}
 
+// ── Voice message recording (MediaRecorder API) ──
+let voiceRecorder   = null;
+let voiceChunks     = [];
+let voiceBlob        = null;
+let voiceStream      = null;
+let voiceTimerInterval = null;
+let voiceSeconds     = 0;
+
+function startVoiceRecording() {{
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
+    alert('Voice recording is not supported on this browser.');
+    return;
+  }}
+  navigator.mediaDevices.getUserMedia({{ audio: true }})
+    .then(stream => {{
+      voiceStream = stream;
+      voiceChunks = [];
+      voiceSeconds = 0;
+      try {{
+        voiceRecorder = new MediaRecorder(stream);
+      }} catch (e) {{
+        alert('Could not start recording on this device.');
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }}
+      voiceRecorder.ondataavailable = (e) => {{ if (e.data.size > 0) voiceChunks.push(e.data); }};
+      voiceRecorder.onstop = () => {{
+        voiceBlob = new Blob(voiceChunks, {{ type: 'audio/webm' }});
+        const url = URL.createObjectURL(voiceBlob);
+        document.getElementById('voice-audio-el').src = url;
+        document.getElementById('voice-recording').style.display = 'none';
+        document.getElementById('voice-preview').style.display = 'flex';
+        clearInterval(voiceTimerInterval);
+        voiceStream.getTracks().forEach(t => t.stop());
+      }};
+      voiceRecorder.start();
+
+      document.getElementById('voice-idle').style.display = 'none';
+      document.getElementById('voice-recording').style.display = 'block';
+      document.getElementById('voice-timer').textContent = '0:00';
+      voiceTimerInterval = setInterval(() => {{
+        voiceSeconds++;
+        const m = Math.floor(voiceSeconds / 60);
+        const s = String(voiceSeconds % 60).padStart(2, '0');
+        document.getElementById('voice-timer').textContent = m + ':' + s;
+        if (voiceSeconds >= 60) stopVoiceRecording(); // safety cap at 60s
+      }}, 1000);
+    }})
+    .catch(() => {{
+      alert('Microphone access denied. Please allow microphone access to record a voice message.');
+    }});
+}}
+
+function stopVoiceRecording() {{
+  if (voiceRecorder && voiceRecorder.state !== 'inactive') {{
+    voiceRecorder.stop();
+  }}
+}}
+
+function discardVoiceRecording() {{
+  voiceBlob = null;
+  document.getElementById('voice-preview').style.display = 'none';
+  document.getElementById('voice-idle').style.display = 'block';
+  document.getElementById('voice-audio-el').src = '';
+}}
+
 // ── In-app message to owner (privacy-preserving, no number exposed) ──
 function sendInAppMessage() {{
   const btn    = document.getElementById('msg-send-btn');
   const body   = document.getElementById('msg-body').value.trim();
   const status = document.getElementById('msg-status');
-  const wantLoc = document.getElementById('msg-loc-toggle').checked;
 
-  if (!body) {{
+  if (!body && !voiceBlob) {{
     status.style.display = 'block';
     status.style.color = '#fecaca';
-    status.textContent = 'Please write a message first.';
+    status.textContent = 'Please write a message or record a voice note first.';
     return;
   }}
 
@@ -4737,15 +4869,15 @@ function sendInAppMessage() {{
   btn.textContent = 'Sending…';
 
   function doSend(lat, lng) {{
-    const form = new URLSearchParams();
-    form.append('body', body);
+    const form = new FormData();
+    if (body) form.append('body', body);
     if (lat != null) form.append('latitude', lat);
     if (lng != null) form.append('longitude', lng);
+    if (voiceBlob) form.append('audio', voiceBlob, 'voice-message.webm');
 
     fetch('/scan/{qr_id}/send-message', {{
       method: 'POST',
-      headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
-      body: form.toString()
+      body: form
     }})
     .then(r => r.json())
     .then(data => {{
@@ -4756,6 +4888,7 @@ function sendInAppMessage() {{
         status.style.color = '#bbf7d0';
         status.textContent = '✅ Message sent to the owner.';
         document.getElementById('msg-body').value = '';
+        discardVoiceRecording();
       }} else {{
         status.style.color = '#fecaca';
         status.textContent = data.detail || 'Could not send. Please try again.';
@@ -4770,10 +4903,12 @@ function sendInAppMessage() {{
     }});
   }}
 
-  if (wantLoc && navigator.geolocation) {{
+  // Location is always attempted automatically — if the browser denies
+  // permission or it's unavailable, the message still sends without it.
+  if (navigator.geolocation) {{
     navigator.geolocation.getCurrentPosition(
       (pos) => doSend(pos.coords.latitude, pos.coords.longitude),
-      () => doSend(null, null),  // location denied/unavailable — send without it
+      () => doSend(null, null),
       {{ timeout: 8000 }}
     );
   }} else {{

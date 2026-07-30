@@ -46,7 +46,7 @@ import httpx
 import psycopg2.extras
 import jwt                          # pip install pyjwt
 from fastapi import APIRouter, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -985,7 +985,8 @@ async def get_messages(authorization: Optional[str] = Header(None)):
 
         cur.execute(
             """
-            SELECT id, body, latitude, longitude, created_at
+            SELECT id, body, latitude, longitude, created_at,
+                   (audio_data IS NOT NULL) AS has_audio
             FROM messages
             WHERE qr_id = %s
             ORDER BY created_at DESC
@@ -1008,3 +1009,37 @@ async def get_messages(authorization: Optional[str] = Header(None)):
         messages.append(m)
 
     return JSONResponse({"messages": messages})
+
+
+@app_router.get("/messages/{message_id}/audio")
+async def get_message_audio(message_id: int, authorization: Optional[str] = Header(None)):
+    """
+    Streams the raw audio bytes for a voice message. Verifies the message
+    actually belongs to the caller's family (owner or one of their
+    emergency-contact sub-IDs) before returning anything.
+    """
+    payload    = _require_auth(authorization)
+    sticker_id = payload["sticker_id"]
+    root_id    = get_family_root_qr_id(sticker_id)
+
+    get_db, release_db = _get_db_funcs()
+    conn = get_db()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute(
+            "SELECT qr_id, audio_data, audio_mime FROM messages WHERE id = %s",
+            (message_id,)
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        release_db(conn)
+
+    if not row or row["qr_id"] != root_id:
+        raise HTTPException(status_code=404, detail="Voice message not found.")
+    if not row.get("audio_data"):
+        raise HTTPException(status_code=404, detail="This message has no voice recording.")
+
+    audio_bytes = bytes(row["audio_data"])
+    mime = row.get("audio_mime") or "audio/webm"
+    return Response(content=audio_bytes, media_type=mime)

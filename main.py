@@ -4483,8 +4483,9 @@ function pcClose() {{
 <!-- CALL EMERGENCY CONTACTS VIA PASBAAN (masked, sequential fallback) -->
 {ec_call_card}
 
-<!-- SEND A MESSAGE (in-app, privacy-preserving — no number exposed) -->
-<div class="card" id="msg-card" style="background:linear-gradient(135deg,#0c4a6e 0%,#075985 100%);border:none;padding:20px;">
+<!-- SEND A MESSAGE (in-app, privacy-preserving — Premium only, since Basic
+     plan communicates directly via WhatsApp/plain numbers instead) -->
+{f'''<div class="card" id="msg-card" style="background:linear-gradient(135deg,#0c4a6e 0%,#075985 100%);border:none;padding:20px;">
   <div class="sec-title" style="color:#bae6fd;margin-bottom:6px;">💬 Send a Message</div>
   <p style="font-size:13px;color:#7dd3fc;margin-bottom:14px;line-height:1.6">
     Couldn't reach anyone by call? Leave a message — it goes straight to the owner's app, privately.
@@ -4536,10 +4537,11 @@ function pcClose() {{
   </button>
   <div id="msg-status" style="font-size:13px;margin-top:12px;padding:10px 12px;border-radius:10px;
        text-align:center;display:none;line-height:1.55;background:rgba(255,255,255,.1);"></div>
-</div>
+</div>''' if show_masked_call else ''}
 
-<!-- LIVE LOCATION CARD (moved up — before emergency numbers) -->
-<div class="card" style="background:linear-gradient(135deg,#f0fdf4 0%,#dcfce7 100%);
+<!-- LIVE LOCATION CARD (WhatsApp-based — Basic plan only now, since Premium
+     shares location through the in-app message feature instead) -->
+{f'''<div class="card" style="background:linear-gradient(135deg,#f0fdf4 0%,#dcfce7 100%);
      border:1.5px solid #86efac;overflow:hidden;position:relative;">
   <div style="position:absolute;top:-18px;right:-18px;font-size:80px;opacity:.07;
               pointer-events:none;line-height:1">📍</div>
@@ -4570,7 +4572,7 @@ function pcClose() {{
   <div id="contact-send-list" style="display:none;margin-top:12px;
        background:#fff;border-radius:12px;overflow:hidden;border:1.5px solid #bbf7d0;">
   </div>
-</div>
+</div>''' if show_plain_contacts_card else ''}
 
 {f'''<!-- EMERGENCY CONTACTS -->
 <div class="card" style="border:1.5px solid #e0e7ff;">

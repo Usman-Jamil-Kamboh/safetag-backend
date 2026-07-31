@@ -35,12 +35,15 @@ HOW WebRTC WORKS (simple explanation):
 
 TURN SERVER:
   For calls over mobile data (not WiFi), you need a TURN server.
-  Sign up free at https://www.metered.ca/tools/openrelay/
-  They give you free TURN credentials. Add to Render env vars:
-    TURN_URL       → turns:openrelay.metered.ca:443
+  Sign up free at https://dashboard.metered.ca/signup (free plan = 20GB/mo)
+  Create an app, generate a credential, and add to Render env vars:
+    TURN_DOMAIN    → standard.relay.metered.ca   (shown on your dashboard)
     TURN_USERNAME  → (from metered.ca dashboard)
     TURN_PASSWORD  → (from metered.ca dashboard)
-  Without this, calls will work on WiFi but may fail on mobile data.
+  This automatically builds the full recommended set of TURN URLs
+  (port 80, 443, TCP, TLS) for best reliability on restrictive mobile
+  networks. Without this, calls will work on WiFi but often fail —
+  connects but no audio — on mobile data.
 """
 
 import asyncio
@@ -55,9 +58,13 @@ from app_routes import get_fcm_token_for_qr, get_call_display_info
 # TURN SERVER CONFIG  (set these in Render env vars)
 # ─────────────────────────────────────────────────────────────────────────────
 
-TURN_URL      = os.getenv("TURN_URL",      "")
+TURN_DOMAIN   = os.getenv("TURN_DOMAIN",   "")
 TURN_USERNAME = os.getenv("TURN_USERNAME", "")
 TURN_PASSWORD = os.getenv("TURN_PASSWORD", "")
+
+# Backward-compat: if someone still has the old single-URL TURN_URL env var
+# set (from before this multi-URL upgrade), keep honouring it too.
+TURN_URL_LEGACY = os.getenv("TURN_URL", "")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTER
@@ -371,14 +378,16 @@ async def turn_credentials():
     Returns TURN server credentials for WebRTC.
     Both the browser and Flutter app call this before making a call.
 
-    If TURN env vars are not set, returns only Google's free STUN server
-    (works on WiFi, may fail on mobile data).
+    If TURN_DOMAIN/TURN_USERNAME/TURN_PASSWORD are not set, returns only
+    Google's free STUN servers (works on WiFi, often fails — connects but
+    no audio — on mobile data / restrictive networks).
 
     Returns:
     {
       "ice_servers": [
         { "urls": "stun:stun.l.google.com:19302" },
-        { "urls": "turns:...", "username": "...", "credential": "..." }
+        { "urls": "turn:standard.relay.metered.ca:80", "username": "...", "credential": "..." },
+        ...
       ]
     }
     """
@@ -388,10 +397,26 @@ async def turn_credentials():
         {"urls": "stun:stun1.l.google.com:19302"},
     ]
 
-    # Add TURN server if configured
-    if TURN_URL and TURN_USERNAME and TURN_PASSWORD:
+    if TURN_DOMAIN and TURN_USERNAME and TURN_PASSWORD:
+        # Full recommended set (port 80, 443, TCP, TLS) — covers networks
+        # that block plain UDP/TCP but allow standard web ports, which is
+        # common on restrictive mobile carrier networks.
+        for url in (
+            f"stun:{TURN_DOMAIN}:80",
+            f"turn:{TURN_DOMAIN}:80",
+            f"turn:{TURN_DOMAIN}:80?transport=tcp",
+            f"turn:{TURN_DOMAIN}:443",
+            f"turns:{TURN_DOMAIN}:443?transport=tcp",
+        ):
+            entry = {"urls": url}
+            if url.startswith("turn"):
+                entry["username"]   = TURN_USERNAME
+                entry["credential"] = TURN_PASSWORD
+            ice_servers.append(entry)
+    elif TURN_URL_LEGACY and TURN_USERNAME and TURN_PASSWORD:
+        # Old single-URL config, still honoured for backward compatibility
         ice_servers.append({
-            "urls":       TURN_URL,
+            "urls":       TURN_URL_LEGACY,
             "username":   TURN_USERNAME,
             "credential": TURN_PASSWORD,
         })

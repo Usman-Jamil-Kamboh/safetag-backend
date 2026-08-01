@@ -1877,7 +1877,7 @@ async def save_setup(
         chosen_plan = "basic"
     db_create_subscription(qr_id, chosen_plan)
 
-    response = HTMLResponse(page_success(qr_id, owner_name.strip(), chosen_plan))
+    response = HTMLResponse(page_success(qr_id, owner_name.strip(), chosen_plan, contacts))
     response.delete_cookie(f"plan_{qr_id}")
     return response
 
@@ -1922,6 +1922,11 @@ async def switch_to_premium(qr_id: str, request: Request, pin: str = Form(...)):
     if record.get("owner_pin") and not verify_pin(pin, record["owner_pin"]):
         return HTMLResponse(_pin_error_page(qr_id, "Incorrect PIN. Plan not changed."))
     db_switch_plan(qr_id, "premium")
+    owner_data = record["owner_data"]
+    if isinstance(owner_data, str):
+        owner_data = json.loads(owner_data)
+    contacts = owner_data.get("contacts", [])
+    login_ids_card = _app_login_ids_card(qr_id, contacts) if contacts else ""
     return HTMLResponse(f"""<!DOCTYPE html><html lang="en">
 <head><meta charset="UTF-8">{_css()}<title>Switched to Premium</title>
 <meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -1933,6 +1938,7 @@ async def switch_to_premium(qr_id: str, request: Request, pin: str = Form(...)):
     Masked calling via Pasbaan is active and free — your numbers are now hidden from every scanner.
   </p>
 </div>
+{login_ids_card}
 <a href="/scan/{qr_id}" class="btn btn-ghost" style="display:block;text-align:center;text-decoration:none;margin-top:10px">
   View contact page &#8594;</a>
 </div></body></html>""")
@@ -5094,7 +5100,8 @@ function sendLocationToOwner() {{
 </body></html>"""
 
 
-def page_success(qr_id: str, name: str, plan: str = "basic") -> str:
+def page_success(qr_id: str, name: str, plan: str = "basic", contacts: list = None) -> str:
+    contacts = contacts or []
     plan_badge = (
         '<div style="display:inline-block;margin-bottom:14px;padding:5px 16px;'
         'background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;'
@@ -5111,6 +5118,10 @@ def page_success(qr_id: str, name: str, plan: str = "basic") -> str:
         "<p style='font-size:12px;color:#166534;margin-top:8px;line-height:1.6'>"
         "📞 Basic: Your contact numbers are visible to anyone who scans your sticker.</p>"
     )
+    # Premium owners need to know each emergency contact's app login ID
+    # RIGHT AWAY — this is the #1 point of confusion otherwise (people log
+    # into the wrong ID, or don't know one exists for them at all).
+    login_ids_card = _app_login_ids_card(qr_id, contacts) if plan == "premium" and contacts else ""
     return f"""<!DOCTYPE html><html lang="en">
 <head><meta charset="UTF-8">{_css()}<title>Activated!</title></head>
 <body><div class="wrap">{_logo()}
@@ -5128,6 +5139,7 @@ def page_success(qr_id: str, name: str, plan: str = "basic") -> str:
     <code style="font-size:17px;font-weight:700">{qr_id}</code>
   </div>
 </div>
+{login_ids_card}
 <a href="/scan/{qr_id}" class="btn btn-ghost" style="display:block;text-align:center;text-decoration:none">
   Preview my contact page →</a>
 </div></body></html>"""

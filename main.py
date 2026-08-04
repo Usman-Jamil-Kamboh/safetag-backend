@@ -2011,6 +2011,7 @@ async def send_message_route(
     latitude: Optional[float] = Form(None),
     longitude: Optional[float] = Form(None),
     audio: Optional[UploadFile] = File(None),
+    notify_contacts: Optional[str] = Form(None),
 ):
     """
     Lets a scanner send a text and/or voice message (optionally with their
@@ -2018,8 +2019,16 @@ async def send_message_route(
     on either side. Used as a fallback when a call doesn't connect, or for
     any non-urgent note (e.g. "your lights are on").
 
-    Message is stored against the family root sticker ID, so the owner
-    AND every emergency contact see it in their shared inbox.
+    Message is stored ONCE against the family root sticker ID, so the
+    owner AND every emergency contact already see it in their shared
+    inbox regardless. `notify_contacts` only controls who gets a PUSH
+    NOTIFICATION about it right now:
+      - not set  → only the owner's device is pushed (default, used by
+                   the "Call via Pasbaan" message button)
+      - "true"   → the owner's device AND every emergency contact's
+                   device are pushed (used by the "Call Emergency
+                   Contacts" message button, so a single tap reaches
+                   everyone's phone at once)
     """
     qr_id = qr_id.upper()
     record = db_get_record(qr_id)
@@ -2058,15 +2067,24 @@ async def send_message_route(
         cur.close()
         release_db(conn)
 
-    # Notify the owner's device (best-effort — message is already saved
-    # either way, so a failed push here doesn't fail the request)
+    # Notify device(s) — best-effort, message is already saved either way
+    preview = body if body else "🎤 Voice message"
     try:
         from app_routes import get_fcm_token_for_qr
-        fcm_token = get_fcm_token_for_qr(qr_id)
-        if fcm_token:
-            from fcm_push import send_message_notification
-            preview = body if body else "🎤 Voice message"
-            send_message_notification(qr_id, fcm_token, preview)
+        from fcm_push import send_message_notification
+
+        # Always notify the owner
+        owner_token = get_fcm_token_for_qr(qr_id)
+        if owner_token:
+            send_message_notification(qr_id, owner_token, preview)
+
+        # Optionally fan out to every emergency contact's sub-ID too
+        if notify_contacts == "true":
+            for contact_row in get_contact_subids(qr_id):
+                contact_id = contact_row["qr_id"]
+                contact_token = get_fcm_token_for_qr(contact_id)
+                if contact_token:
+                    send_message_notification(contact_id, contact_token, preview)
     except Exception as e:
         print(f"[Pasbaan] WARNING: message push failed for {qr_id}: {e}", file=sys.stderr)
 
@@ -3855,12 +3873,20 @@ def page_contact(qr_id: str, data: dict, scan_count: int, plan: str = "basic") -
     Free, private call straight to the owner's app — numbers stay hidden on both sides.
   </p>
 
-  <button onclick="pcStart()" id="pc-start-btn" style="width:100%;display:flex;align-items:center;justify-content:center;gap:10px;padding:16px 18px;
-     background:rgba(255,255,255,.14);backdrop-filter:blur(8px);
-     border:1.5px solid rgba(255,255,255,.3);border-radius:14px;
-     color:#fff;font-size:15px;font-weight:700;cursor:pointer;font-family:inherit;">
-    📞 Call via Pasbaan
-  </button>
+  <div style="display:flex;gap:10px;">
+    <button onclick="openMsgComposer('owner')" style="flex:1;display:flex;align-items:center;justify-content:center;gap:8px;padding:16px 10px;
+       background:rgba(255,255,255,.10);backdrop-filter:blur(8px);
+       border:1.5px solid rgba(255,255,255,.25);border-radius:14px;
+       color:#fff;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;">
+      💬 Message
+    </button>
+    <button onclick="pcStart()" id="pc-start-btn" style="flex:1;display:flex;align-items:center;justify-content:center;gap:8px;padding:16px 10px;
+       background:rgba(255,255,255,.22);backdrop-filter:blur(8px);
+       border:1.5px solid rgba(255,255,255,.4);border-radius:14px;
+       color:#fff;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;">
+      📞 Call
+    </button>
+  </div>
 </div>"""
 
     # ── Call Emergency Contacts via Pasbaan (masked, sequential fallback) ──
@@ -3880,12 +3906,20 @@ def page_contact(qr_id: str, data: dict, scan_count: int, plan: str = "basic") -
   <p style="font-size:13px;color:#fca5a5;margin-bottom:14px;line-height:1.6">
     Free, private call to the family's app. If one doesn't answer, the next is tried automatically.
   </p>
-  <button onclick="ecStart()" id="ec-start-btn" style="width:100%;display:flex;align-items:center;justify-content:center;gap:10px;padding:16px 18px;
-     background:rgba(255,255,255,.14);backdrop-filter:blur(8px);
-     border:1.5px solid rgba(255,255,255,.3);border-radius:14px;
-     color:#fff;font-size:15px;font-weight:700;cursor:pointer;font-family:inherit;">
-    🆘 Call Emergency Contacts
-  </button>
+  <div style="display:flex;gap:10px;">
+    <button onclick="openMsgComposer('contacts')" style="flex:1;display:flex;align-items:center;justify-content:center;gap:8px;padding:16px 10px;
+       background:rgba(255,255,255,.10);backdrop-filter:blur(8px);
+       border:1.5px solid rgba(255,255,255,.25);border-radius:14px;
+       color:#fff;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;">
+      💬 Message
+    </button>
+    <button onclick="ecStart()" id="ec-start-btn" style="flex:1;display:flex;align-items:center;justify-content:center;gap:8px;padding:16px 10px;
+       background:rgba(255,255,255,.22);backdrop-filter:blur(8px);
+       border:1.5px solid rgba(255,255,255,.4);border-radius:14px;
+       color:#fff;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;">
+      🆘 Call
+    </button>
+  </div>
 </div>"""
 
     # Build WhatsApp number list — only contacts marked as WhatsApp
@@ -4489,60 +4523,77 @@ function pcClose() {{
 <!-- CALL EMERGENCY CONTACTS VIA PASBAAN (masked, sequential fallback) -->
 {ec_call_card}
 
-<!-- SEND A MESSAGE (in-app, privacy-preserving — Premium only, since Basic
-     plan communicates directly via WhatsApp/plain numbers instead) -->
-{f'''<div class="card" id="msg-card" style="background:linear-gradient(135deg,#0c4a6e 0%,#075985 100%);border:none;padding:20px;">
-  <div class="sec-title" style="color:#bae6fd;margin-bottom:6px;">💬 Send a Message</div>
-  <p style="font-size:13px;color:#7dd3fc;margin-bottom:14px;line-height:1.6">
-    Couldn't reach anyone by call? Leave a message — it goes straight to the owner's app, privately.
-  </p>
-  <textarea id="msg-body" maxlength="1000" rows="3" placeholder="e.g. Your car is blocking the driveway, please move it..."
-    style="width:100%;padding:12px 14px;border-radius:12px;border:1.5px solid rgba(255,255,255,.25);
-           background:rgba(255,255,255,.08);color:#fff;font-size:14px;font-family:inherit;
-           resize:vertical;margin-bottom:10px;box-sizing:border-box;"></textarea>
+<!-- MESSAGE COMPOSER MODAL (opened from either call card's "Message" button) -->
+{f'''<div id="msg-modal" style="display:none;position:fixed;inset:0;z-index:200;
+     background:rgba(5,10,20,.75);backdrop-filter:blur(4px);
+     align-items:flex-end;justify-content:center;">
+  <div style="width:100%;max-width:480px;max-height:88vh;overflow-y:auto;
+       background:#0c1420;border-radius:22px 22px 0 0;padding:22px 20px 26px;
+       box-shadow:0 -10px 40px rgba(0,0,0,.5);">
 
-  <!-- Voice recorder -->
-  <div id="voice-idle" style="margin-bottom:12px;">
-    <button type="button" onclick="startVoiceRecording()" id="voice-record-btn"
-      style="width:100%;display:flex;align-items:center;justify-content:center;gap:8px;
-             padding:11px;border:1.5px dashed rgba(255,255,255,.35);border-radius:12px;
-             background:rgba(255,255,255,.06);color:#bae6fd;font-size:13.5px;font-weight:600;
-             cursor:pointer;font-family:inherit;">
-      🎤 Or record a voice message instead
-    </button>
-  </div>
-  <div id="voice-recording" style="display:none;margin-bottom:12px;padding:14px;
-       background:rgba(239,68,68,.15);border:1.5px solid rgba(239,68,68,.4);border-radius:12px;
-       text-align:center;">
-    <div style="font-size:13px;color:#fecaca;margin-bottom:8px;">
-      🔴 Recording… <span id="voice-timer">0:00</span>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+      <div class="sec-title" id="msg-modal-title" style="color:#bae6fd;margin-bottom:0;">💬 Send a Message</div>
+      <button onclick="closeMsgComposer()" style="background:rgba(255,255,255,.08);border:none;
+              width:30px;height:30px;border-radius:50%;color:#9ca3af;font-size:16px;cursor:pointer;">✕</button>
     </div>
-    <button type="button" onclick="stopVoiceRecording()"
-      style="padding:9px 20px;border:none;border-radius:10px;background:#ef4444;color:#fff;
-             font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;">
-      ⬛ Stop Recording
-    </button>
-  </div>
-  <div id="voice-preview" style="display:none;margin-bottom:12px;padding:12px;
-       background:rgba(255,255,255,.08);border-radius:12px;
-       align-items:center;gap:10px;">
-    <audio id="voice-audio-el" controls style="flex:1;height:36px;"></audio>
-    <button type="button" onclick="discardVoiceRecording()" title="Remove"
-      style="width:32px;height:32px;border:none;border-radius:8px;background:rgba(239,68,68,.25);
-             color:#fecaca;font-size:14px;cursor:pointer;flex-shrink:0;">✕</button>
-  </div>
+    <p id="msg-modal-sub" style="font-size:12.5px;color:#7dd3fc;margin-bottom:16px;line-height:1.6"></p>
 
-  <p style="font-size:11.5px;color:#7dd3fc;margin-bottom:12px;display:flex;align-items:center;gap:5px;">
-    📍 Your current location is shared automatically with the owner.
-  </p>
-  <button onclick="sendInAppMessage()" id="msg-send-btn" style="width:100%;padding:15px;border:none;border-radius:13px;
-     background:rgba(255,255,255,.14);backdrop-filter:blur(8px);
-     border:1.5px solid rgba(255,255,255,.3);color:#fff;font-size:15px;font-weight:700;
-     cursor:pointer;font-family:inherit;">
-    Send Message
-  </button>
-  <div id="msg-status" style="font-size:13px;margin-top:12px;padding:10px 12px;border-radius:10px;
-       text-align:center;display:none;line-height:1.55;background:rgba(255,255,255,.1);"></div>
+    <!-- Quick messages -->
+    <p style="font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:8px;">
+      Quick Messages
+    </p>
+    <div id="quick-msg-list" style="display:flex;flex-direction:column;gap:8px;margin-bottom:18px;"></div>
+
+    <p style="font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:8px;">
+      Or Write Your Own
+    </p>
+    <textarea id="msg-body" maxlength="1000" rows="3" placeholder="e.g. Your car is blocking the driveway, please move it..."
+      style="width:100%;padding:12px 14px;border-radius:12px;border:1.5px solid rgba(255,255,255,.18);
+             background:rgba(255,255,255,.06);color:#fff;font-size:14px;font-family:inherit;
+             resize:vertical;margin-bottom:10px;box-sizing:border-box;"></textarea>
+
+    <!-- Voice recorder -->
+    <div id="voice-idle" style="margin-bottom:12px;">
+      <button type="button" onclick="startVoiceRecording()" id="voice-record-btn"
+        style="width:100%;display:flex;align-items:center;justify-content:center;gap:8px;
+               padding:11px;border:1.5px dashed rgba(255,255,255,.3);border-radius:12px;
+               background:rgba(255,255,255,.04);color:#bae6fd;font-size:13.5px;font-weight:600;
+               cursor:pointer;font-family:inherit;">
+        🎤 Or record a voice message instead
+      </button>
+    </div>
+    <div id="voice-recording" style="display:none;margin-bottom:12px;padding:14px;
+         background:rgba(239,68,68,.15);border:1.5px solid rgba(239,68,68,.4);border-radius:12px;
+         text-align:center;">
+      <div style="font-size:13px;color:#fecaca;margin-bottom:8px;">
+        🔴 Recording… <span id="voice-timer">0:00</span>
+      </div>
+      <button type="button" onclick="stopVoiceRecording()"
+        style="padding:9px 20px;border:none;border-radius:10px;background:#ef4444;color:#fff;
+               font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;">
+        ⬛ Stop Recording
+      </button>
+    </div>
+    <div id="voice-preview" style="display:none;margin-bottom:12px;padding:12px;
+         background:rgba(255,255,255,.06);border-radius:12px;
+         align-items:center;gap:10px;">
+      <audio id="voice-audio-el" controls style="flex:1;height:36px;"></audio>
+      <button type="button" onclick="discardVoiceRecording()" title="Remove"
+        style="width:32px;height:32px;border:none;border-radius:8px;background:rgba(239,68,68,.25);
+               color:#fecaca;font-size:14px;cursor:pointer;flex-shrink:0;">✕</button>
+    </div>
+
+    <p style="font-size:11.5px;color:#7dd3fc;margin-bottom:14px;display:flex;align-items:center;gap:5px;">
+      📍 Your current location is shared automatically.
+    </p>
+    <button onclick="sendInAppMessage()" id="msg-send-btn" style="width:100%;padding:15px;border:none;border-radius:13px;
+       background:linear-gradient(135deg,#0284c7,#0369a1);color:#fff;font-size:15px;font-weight:700;
+       cursor:pointer;font-family:inherit;">
+      Send Message
+    </button>
+    <div id="msg-status" style="font-size:13px;margin-top:12px;padding:10px 12px;border-radius:10px;
+         text-align:center;display:none;line-height:1.55;background:rgba(255,255,255,.08);"></div>
+  </div>
 </div>''' if show_masked_call else ''}
 
 <!-- LIVE LOCATION CARD (WhatsApp-based — Basic plan only now, since Premium
@@ -4802,6 +4853,98 @@ let voiceStream      = null;
 let voiceTimerInterval = null;
 let voiceSeconds     = 0;
 
+// ── Message composer modal (opened from either call card) ──
+const QUICK_MESSAGES = [
+  "Your car's lights are on.",
+  "Your car is blocking my way, please move it.",
+  "Your car's alarm is going off.",
+  "There's an emergency — please call me back.",
+  "Just checking, is everything okay with your car?"
+];
+let msgTarget = 'owner';  // 'owner' or 'contacts'
+
+function openMsgComposer(target) {{
+  msgTarget = target;
+  const title = document.getElementById('msg-modal-title');
+  const sub   = document.getElementById('msg-modal-sub');
+  if (target === 'contacts') {{
+    title.textContent = '💬 Message Emergency Contacts';
+    sub.textContent = "Sends to every emergency contact's app in one tap — private, no numbers shown.";
+  }} else {{
+    title.textContent = '💬 Message the Owner';
+    sub.textContent = "Couldn't reach anyone by call? Leave a message — goes straight to the owner's app, privately.";
+  }}
+
+  const list = document.getElementById('quick-msg-list');
+  list.innerHTML = '';
+  QUICK_MESSAGES.forEach(msg => {{
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = msg;
+    btn.style.cssText = 'text-align:left;width:100%;padding:12px 14px;border-radius:12px;'
+      + 'border:1.5px solid rgba(255,255,255,.14);background:rgba(255,255,255,.05);'
+      + 'color:#e2e8f0;font-size:13.5px;cursor:pointer;font-family:inherit;line-height:1.4;';
+    btn.onclick = () => sendQuickMessage(msg, btn);
+    list.appendChild(btn);
+  }});
+
+  document.getElementById('msg-modal').style.display = 'flex';
+}}
+
+function closeMsgComposer() {{
+  document.getElementById('msg-modal').style.display = 'none';
+}}
+
+function sendQuickMessage(text, btnEl) {{
+  const allBtns = document.querySelectorAll('#quick-msg-list button');
+  allBtns.forEach(b => b.disabled = true);
+  const original = btnEl.textContent;
+  btnEl.textContent = 'Sending…';
+
+  function doSend(lat, lng) {{
+    const form = new FormData();
+    form.append('body', text);
+    if (lat != null) form.append('latitude', lat);
+    if (lng != null) form.append('longitude', lng);
+    if (msgTarget === 'contacts') form.append('notify_contacts', 'true');
+
+    fetch('/scan/{qr_id}/send-message', {{ method: 'POST', body: form }})
+      .then(r => r.json())
+      .then(data => {{
+        allBtns.forEach(b => b.disabled = false);
+        btnEl.textContent = original;
+        const status = document.getElementById('msg-status');
+        status.style.display = 'block';
+        if (data.ok) {{
+          status.style.color = '#bbf7d0';
+          status.textContent = '✅ Message sent.';
+          setTimeout(closeMsgComposer, 1200);
+        }} else {{
+          status.style.color = '#fecaca';
+          status.textContent = data.detail || 'Could not send. Please try again.';
+        }}
+      }})
+      .catch(() => {{
+        allBtns.forEach(b => b.disabled = false);
+        btnEl.textContent = original;
+        const status = document.getElementById('msg-status');
+        status.style.display = 'block';
+        status.style.color = '#fecaca';
+        status.textContent = 'Network error. Please try again.';
+      }});
+  }}
+
+  if (navigator.geolocation) {{
+    navigator.geolocation.getCurrentPosition(
+      (pos) => doSend(pos.coords.latitude, pos.coords.longitude),
+      () => doSend(null, null),
+      {{ timeout: 8000 }}
+    );
+  }} else {{
+    doSend(null, null);
+  }}
+}}
+
 function startVoiceRecording() {{
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
     alert('Voice recording is not supported on this browser.');
@@ -4882,6 +5025,7 @@ function sendInAppMessage() {{
     if (lat != null) form.append('latitude', lat);
     if (lng != null) form.append('longitude', lng);
     if (voiceBlob) form.append('audio', voiceBlob, 'voice-message.webm');
+    if (msgTarget === 'contacts') form.append('notify_contacts', 'true');
 
     fetch('/scan/{qr_id}/send-message', {{
       method: 'POST',
@@ -4894,9 +5038,10 @@ function sendInAppMessage() {{
       status.style.display = 'block';
       if (data.ok) {{
         status.style.color = '#bbf7d0';
-        status.textContent = '✅ Message sent to the owner.';
+        status.textContent = msgTarget === 'contacts' ? '✅ Sent to all emergency contacts.' : '✅ Message sent to the owner.';
         document.getElementById('msg-body').value = '';
         discardVoiceRecording();
+        setTimeout(closeMsgComposer, 1200);
       }} else {{
         status.style.color = '#fecaca';
         status.textContent = data.detail || 'Could not send. Please try again.';

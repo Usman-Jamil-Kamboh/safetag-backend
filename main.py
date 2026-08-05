@@ -1777,6 +1777,8 @@ async def save_setup(
     contact3_name:      str = Form(""),
     contact3_phone:     str = Form(""),
     contact3_whatsapp:  str = Form(""),
+    blood_group:        str = Form(""),
+    medical_notes:      str = Form(""),
     message:            str = Form(""),
 ):
     record = db_get_record(qr_id)
@@ -1867,6 +1869,8 @@ async def save_setup(
         "city":           city.strip(),
         "contacts":       contacts,
         "message":        message.strip(),
+        "blood_group":    blood_group.strip(),
+        "medical_notes":  medical_notes.strip(),
     }
     db_save_owner(qr_id, payload, hash_pin(owner_pin))
     sync_contact_subids(qr_id, contacts, hash_pin(owner_pin), owner_name.strip(), vehicle_number.strip().upper())
@@ -2186,6 +2190,8 @@ async def save_update(
     contact3_name:      str = Form(""),
     contact3_phone:     str = Form(""),
     contact3_whatsapp:  str = Form(""),
+    blood_group:        str = Form(""),
+    medical_notes:      str = Form(""),
     message:            str = Form(""),
 ):
     record = db_get_record(qr_id)
@@ -2268,6 +2274,8 @@ async def save_update(
         "city":           city.strip(),
         "contacts":       contacts,
         "message":        message.strip(),
+        "blood_group":    blood_group.strip(),
+        "medical_notes":  medical_notes.strip(),
     }
     db_update_owner(qr_id, payload, new_pin_hash)
     effective_pin_hash = new_pin_hash or record.get("owner_pin")
@@ -3655,7 +3663,7 @@ def page_setup(qr_id: str, plan: str = "basic") -> str:
   </p>
   <p style="font-size:11px;color:#ccc;margin-top:10px">Sticker ID: <code>{qr_id}</code></p>
 </div>
-<div class="card" style="background:#f0fdf4;border:1.5px solid #86efac;">
+{f'''<div class="card" style="background:#f0fdf4;border:1.5px solid #86efac;">
   <div class="sec-title" style="color:#166534">📍 WhatsApp Location Feature</div>
   <p style="font-size:13px;color:#166534;line-height:1.7;margin-bottom:8px">
     Pasbaan can send the <strong>live location</strong> of your vehicle to your contacts via WhatsApp
@@ -3671,7 +3679,7 @@ def page_setup(qr_id: str, plan: str = "basic") -> str:
     the location message will not be delivered to that person.
     An SMS fallback option will be available for the scanner to use manually.
   </p>
-</div>
+</div>''' if plan != "premium" else ''}
 <form action="/scan/{qr_id}/setup" method="POST">
   <div class="card" style="background:linear-gradient(135deg,#f8faff 0%,#eef2ff 100%);border:1.5px solid #c7d2fe;">
     <div class="sec-title" style="color:#3730a3">🚗 Your Vehicle</div>
@@ -3685,7 +3693,7 @@ def page_setup(qr_id: str, plan: str = "basic") -> str:
     </div>
     <label style="margin-top:10px;">Your own phone number <span style="color:#94a3b8;font-size:11px;">(optional)</span></label>
     <input name="owner_phone" type="tel" placeholder="+92 300 1234567">
-    <div style="display:flex;align-items:center;gap:8px;margin-top:10px;padding:10px 12px;
+    {f'''<div style="display:flex;align-items:center;gap:8px;margin-top:10px;padding:10px 12px;
                 background:#f0fdf4;border-radius:10px;border:1px solid #86efac;">
       <input type="checkbox" name="owner_whatsapp" value="yes" id="wa_owner"
              style="width:18px;height:18px;cursor:pointer;accent-color:#16a34a;flex-shrink:0;">
@@ -3695,7 +3703,9 @@ def page_setup(qr_id: str, plan: str = "basic") -> str:
     </div>
     <p style="font-size:11px;color:#6366f1;margin-top:6px;line-height:1.5;background:#eef2ff;padding:8px 10px;border-radius:8px;">
       📞 This number will appear as the <strong>"Call Vehicle Owner"</strong> button. If ticked above, it can also receive live location via WhatsApp.
-    </p>
+    </p>''' if plan != "premium" else '''<p style="font-size:11px;color:#6366f1;margin-top:6px;line-height:1.5;background:#eef2ff;padding:8px 10px;border-radius:8px;">
+      🔒 With Premium, this number stays private — scanners reach you only through the free Pasbaan call, never by seeing your number.
+    </p>'''}
   </div>
   <div class="card" style="border:1.5px solid #ddd6fe;">
     <div class="sec-title" style="color:#5b21b6">📋 Emergency Contact 1 <span style="font-size:11px;color:#94a3b8;font-weight:400;">(optional)</span></div>
@@ -3710,14 +3720,14 @@ def page_setup(qr_id: str, plan: str = "basic") -> str:
     <input name="contact1_name" type="text" placeholder="Full name">
     <label>Phone number</label>
     <input name="contact1_phone" type="tel" placeholder="+92 300 1234567">
-    <div style="display:flex;align-items:center;gap:8px;margin-top:10px;padding:10px 12px;
+    {f'''<div style="display:flex;align-items:center;gap:8px;margin-top:10px;padding:10px 12px;
                 background:#f0fdf4;border-radius:10px;border:1px solid #86efac;">
       <input type="checkbox" name="contact1_whatsapp" value="yes" id="wa1"
              style="width:18px;height:18px;cursor:pointer;accent-color:#16a34a;flex-shrink:0;">
       <label for="wa1" style="font-size:13px;color:#166534;cursor:pointer;margin:0;font-weight:600;">
         💬 This number is on WhatsApp (for location sharing)
       </label>
-    </div>
+    </div>''' if plan != "premium" else ''}
   </div>
   <div class="card" style="border:1.5px solid #e0e7ff;">
     <div class="sec-title" style="color:#4338ca">📋 Emergency Contact 2 <span style="font-size:11px;color:#94a3b8;font-weight:400;">(optional)</span></div>
@@ -3730,14 +3740,14 @@ def page_setup(qr_id: str, plan: str = "basic") -> str:
     </select>
     <label>Full name</label><input name="contact2_name" type="text" placeholder="Full name">
     <label>Phone number</label><input name="contact2_phone" type="tel" placeholder="+92 300 1234567">
-    <div style="display:flex;align-items:center;gap:8px;margin-top:10px;padding:10px 12px;
+    {f'''<div style="display:flex;align-items:center;gap:8px;margin-top:10px;padding:10px 12px;
                 background:#f0fdf4;border-radius:10px;border:1px solid #86efac;">
       <input type="checkbox" name="contact2_whatsapp" value="yes" id="wa2"
              style="width:18px;height:18px;cursor:pointer;accent-color:#16a34a;flex-shrink:0;">
       <label for="wa2" style="font-size:13px;color:#166534;cursor:pointer;margin:0;font-weight:600;">
         💬 This number is on WhatsApp (for location sharing)
       </label>
-    </div>
+    </div>''' if plan != "premium" else ''}
   </div>
   <div class="card" style="border:1.5px solid #e0e7ff;">
     <div class="sec-title" style="color:#4338ca">📋 Emergency Contact 3 <span style="font-size:11px;color:#94a3b8;font-weight:400;">(optional)</span></div>
@@ -3750,18 +3760,33 @@ def page_setup(qr_id: str, plan: str = "basic") -> str:
     </select>
     <label>Full name</label><input name="contact3_name" type="text" placeholder="Full name">
     <label>Phone number</label><input name="contact3_phone" type="tel" placeholder="+92 300 1234567">
-    <div style="display:flex;align-items:center;gap:8px;margin-top:10px;padding:10px 12px;
+    {f'''<div style="display:flex;align-items:center;gap:8px;margin-top:10px;padding:10px 12px;
                 background:#f0fdf4;border-radius:10px;border:1px solid #86efac;">
       <input type="checkbox" name="contact3_whatsapp" value="yes" id="wa3"
              style="width:18px;height:18px;cursor:pointer;accent-color:#16a34a;flex-shrink:0;">
       <label for="wa3" style="font-size:13px;color:#166534;cursor:pointer;margin:0;font-weight:600;">
         💬 This number is on WhatsApp (for location sharing)
       </label>
-    </div>
+    </div>''' if plan != "premium" else ''}
   </div>
   <div class="card" style="border:1.5px solid #e2e8f0;">
     <div class="sec-title" style="color:#475569">💬 Message for finder <span style="font-size:11px;color:#94a3b8;font-weight:400;">(optional)</span></div>
     <textarea name="message" placeholder="e.g. Please contact my family in case of emergency. JazakAllah Khair."></textarea>
+
+    <div style="margin-top:16px;padding-top:14px;border-top:1px solid #e2e8f0;">
+      <p style="font-size:12.5px;font-weight:700;color:#b91c1c;margin-bottom:4px;">🩺 Medical Info <span style="font-weight:400;color:#94a3b8;">(optional, but can save your life)</span></p>
+      <p style="font-size:11.5px;color:#94a3b8;margin-bottom:10px;line-height:1.5;">
+        Shown to whoever scans your sticker — helpful if you're ever found injured or unwell.
+      </p>
+      <label>Blood group</label>
+      <select name="blood_group">
+        <option value="">— Not specified —</option>
+        <option>A+</option><option>A-</option><option>B+</option><option>B-</option>
+        <option>AB+</option><option>AB-</option><option>O+</option><option>O-</option>
+      </select>
+      <label style="margin-top:10px;">Allergies / medical conditions</label>
+      <textarea name="medical_notes" rows="2" placeholder="e.g. Diabetic, allergic to penicillin, asthma..."></textarea>
+    </div>
   </div>
   <div class="card" style="background:#fafaf7;border:1.5px solid #e0e0e0;">
     <div class="sec-title">🔒 Set Your Owner PIN</div>
@@ -3858,6 +3883,25 @@ def page_contact(qr_id: str, data: dict, scan_count: int, plan: str = "basic") -
     </div>
     <div style="font-size:28px;color:#60a5fa;font-weight:300;">›</div>
   </a>
+</div>"""
+
+    # ── Medical info card — shown prominently at the top, since this is
+    # the one piece of info that matters most if the owner is ever found
+    # injured/unwell rather than just parked badly.
+    blood_group   = (data.get("blood_group") or "").strip()
+    medical_notes = (data.get("medical_notes") or "").strip()
+    medical_info_card = ""
+    if blood_group or medical_notes:
+        bg_row = f'''<div style="display:flex;align-items:center;gap:10px;margin-bottom:{'10px' if medical_notes else '0'};">
+      <span style="background:#fee2e2;color:#b91c1c;font-weight:800;font-size:13px;
+                   padding:4px 12px;border-radius:8px;">🩸 {blood_group}</span>
+    </div>''' if blood_group else ""
+        notes_row = f'''<p style="font-size:13.5px;color:#7f1d1d;line-height:1.6;">{medical_notes}</p>''' if medical_notes else ""
+        medical_info_card = f"""<div class="card" style="background:linear-gradient(135deg,#fef2f2 0%,#fee2e2 100%);
+     border:1.5px solid #fca5a5;">
+  <div class="sec-title" style="color:#991b1b">🩺 Medical Info</div>
+  {bg_row}
+  {notes_row}
 </div>"""
 
     # ── Call via Pasbaan (WebRTC masked call) ────────────────────────────────
@@ -4513,6 +4557,11 @@ function pcClose() {{
   <p style="font-size:18px;font-weight:700;margin-top:8px;color:#fff">{owner_name_str}</p>
   <p style="font-size:13px;color:#94a3b8;margin-top:3px">📍 {city_str}</p>
 </div>
+
+<!-- MEDICAL INFO (if provided) — shown right after the hero card, since
+     this matters most if the owner is found injured rather than just
+     parked badly -->
+{medical_info_card}
 
 <!-- CALL OWNER CARD (prominent, at the top) -->
 {owner_call_card}
@@ -5479,6 +5528,20 @@ def page_update(qr_id: str, data: dict) -> str:
   <div class="card" style="border:1.5px solid #e2e8f0;">
     <div class="sec-title" style="color:#475569">💬 Message for finder <span style="font-size:11px;color:#94a3b8;font-weight:400;">(optional)</span></div>
     <textarea name="message" placeholder="e.g. Please contact my family in case of emergency.">{data.get('message','')}</textarea>
+
+    <div style="margin-top:16px;padding-top:14px;border-top:1px solid #e2e8f0;">
+      <p style="font-size:12.5px;font-weight:700;color:#b91c1c;margin-bottom:4px;">🩺 Medical Info <span style="font-weight:400;color:#94a3b8;">(optional, but can save your life)</span></p>
+      <p style="font-size:11.5px;color:#94a3b8;margin-bottom:10px;line-height:1.5;">
+        Shown to whoever scans your sticker — helpful if you're ever found injured or unwell.
+      </p>
+      <label>Blood group</label>
+      <select name="blood_group">
+        <option value="" {'selected' if not data.get('blood_group') else ''}>— Not specified —</option>
+        {"".join(f'<option {"selected" if data.get("blood_group")==bg else ""}>{bg}</option>' for bg in ["A+","A-","B+","B-","AB+","AB-","O+","O-"])}
+      </select>
+      <label style="margin-top:10px;">Allergies / medical conditions</label>
+      <textarea name="medical_notes" rows="2" placeholder="e.g. Diabetic, allergic to penicillin, asthma...">{data.get('medical_notes','')}</textarea>
+    </div>
   </div>
   <div class="card" style="background:#fafaf7;border:1.5px solid #e0e0e0;">
     <div class="sec-title">🔒 Change PIN — Optional</div>

@@ -2019,20 +2019,19 @@ async def send_message_route(
 ):
     """
     Lets a scanner send a text and/or voice message (optionally with their
-    live location) straight to the owner's app — no phone number exposed
-    on either side. Used as a fallback when a call doesn't connect, or for
-    any non-urgent note (e.g. "your lights are on").
+    live location) — no phone number exposed on either side. Used as a
+    fallback when a call doesn't connect, or for any non-urgent note
+    (e.g. "your lights are on").
 
-    Message is stored ONCE against the family root sticker ID, so the
-    owner AND every emergency contact already see it in their shared
-    inbox regardless. `notify_contacts` only controls who gets a PUSH
-    NOTIFICATION about it right now:
-      - not set  → only the owner's device is pushed (default, used by
-                   the "Call via Pasbaan" message button)
-      - "true"   → the owner's device AND every emergency contact's
-                   device are pushed (used by the "Call Emergency
-                   Contacts" message button, so a single tap reaches
-                   everyone's phone at once)
+    Each recipient has their OWN separate inbox — a message is stored as
+    its own row against the exact identity it's addressed to, so nobody
+    sees messages meant for someone else:
+      - notify_contacts not set → ONE copy, stored for the owner only
+        (used by the "Call via Pasbaan" message button)
+      - notify_contacts="true"  → ONE copy PER emergency contact,
+        stored separately in each contact's own inbox — the owner does
+        NOT see these (used by the "Call Emergency Contacts" message
+        button, so one tap reaches every contact's own inbox+phone)
     """
     qr_id = qr_id.upper()
     record = db_get_record(qr_id)
@@ -2054,15 +2053,24 @@ async def send_message_route(
     if not body and not audio_bytes:
         raise HTTPException(status_code=400, detail="Please write a message or record a voice note.")
 
+    # Decide the list of recipient sticker_ids — each gets their own row
+    if notify_contacts == "true":
+        recipient_ids = [row["qr_id"] for row in get_contact_subids(qr_id)]
+        if not recipient_ids:
+            raise HTTPException(status_code=400, detail="No emergency contacts are set up for this vehicle.")
+    else:
+        recipient_ids = [qr_id]
+
     conn = get_db()
     cur  = conn.cursor()
     try:
-        cur.execute(
-            """INSERT INTO messages (qr_id, body, audio_data, audio_mime, latitude, longitude)
-               VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
-            (qr_id, body or None, psycopg2.Binary(audio_bytes) if audio_bytes else None,
-             audio_mime, latitude, longitude)
-        )
+        for recipient_id in recipient_ids:
+            cur.execute(
+                """INSERT INTO messages (qr_id, body, audio_data, audio_mime, latitude, longitude)
+                   VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+                (recipient_id, body or None, psycopg2.Binary(audio_bytes) if audio_bytes else None,
+                 audio_mime, latitude, longitude)
+            )
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -2071,24 +2079,16 @@ async def send_message_route(
         cur.close()
         release_db(conn)
 
-    # Notify device(s) — best-effort, message is already saved either way
+    # Push-notify each recipient's device — best-effort, message is
+    # already saved either way, so a failed push doesn't fail the request
     preview = body if body else "🎤 Voice message"
     try:
         from app_routes import get_fcm_token_for_qr
         from fcm_push import send_message_notification
-
-        # Always notify the owner
-        owner_token = get_fcm_token_for_qr(qr_id)
-        if owner_token:
-            send_message_notification(qr_id, owner_token, preview)
-
-        # Optionally fan out to every emergency contact's sub-ID too
-        if notify_contacts == "true":
-            for contact_row in get_contact_subids(qr_id):
-                contact_id = contact_row["qr_id"]
-                contact_token = get_fcm_token_for_qr(contact_id)
-                if contact_token:
-                    send_message_notification(contact_id, contact_token, preview)
+        for recipient_id in recipient_ids:
+            token = get_fcm_token_for_qr(recipient_id)
+            if token:
+                send_message_notification(recipient_id, token, preview)
     except Exception as e:
         print(f"[Pasbaan] WARNING: message push failed for {qr_id}: {e}", file=sys.stderr)
 
